@@ -1,29 +1,69 @@
 #!/bin/sh
-# Root helper for the USB Mic app: adds or removes a USB microphone (UAC1) on the
+# Root helper for the USB Mic app: adds or removes a USB headset (UAC1) on the
 # phone's running USB gadget. In memory only; a reboot removes it. Usage: on | off
-set -e
+#
+# Each run is one transaction: take a lock, snapshot what's there, change it, and
+# on any failure put the snapshot back and rebind, so the phone stays on the PC.
+set -eu
+umask 077
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
 G=/sys/kernel/config/usb_gadget/g1
 F=functions/uac1.mic
+STATE=/run/usb-mic            # root-only: what to put back on "off"
 # Windows caches a device's descriptors by vendor, product and bcdDevice, so a
 # changed set of functions needs its own bcdDevice to be seen (as glkvm does).
-MIC_BCD=0x0304  # each digit 0-9: the kernel rejects others
-SAVED=/run/usb-mic-bcddevice
-# Other functions linked before the mic was added. They come off while it's on:
-# on this kernel the serial port carries an IAD and UAC1 doesn't, and Windows then
-# splits the mic's interfaces apart and fails to start it (problem code 10).
-LINKS=/run/usb-mic-links
-# Device name and serial shown to the PC while the mic is on (the phone's own
-# include "FLX1s"). The mic's terminal names are fixed in this kernel's f_uac1.
+MIC_BCD=0x0305                # each digit 0-9: the kernel rejects others
+# Device name and serial shown to the PC while on (the phone's own include
+# "FLX1s"). The terminal names inside are fixed in this kernel's f_uac1.
 MIC_PRODUCT="Terminal Headset"
 MIC_SERIAL="TH0001"
-NAMES=/run/usb-mic-names
-[ -d "$G" ] || { echo "no USB gadget g1" >&2; exit 1; }
+
+fail() { echo "usb-mic-helper: $*" >&2; exit 1; }
+
+[ "$#" -eq 1 ] || { echo "usage: $0 on|off" >&2; exit 2; }
+[ -d "$G" ] || fail "no USB gadget g1"
+
+# Private state directory, created by root and nobody else.
+if [ -e "$STATE" ] && { [ -L "$STATE" ] || [ ! -d "$STATE" ] || [ "$(stat -c %u "$STATE")" != 0 ]; }; then
+    fail "$STATE is not a root-owned directory"
+fi
+mkdir -p -m 700 "$STATE"
+chmod 700 "$STATE"
+
+# One run at a time.
+exec 9>"$STATE/lock"
+flock -w 10 9 || fail "another change is still running"
+
+# State left by the earlier helper, which kept it loose in /run.
+if [ ! -d "$STATE/saved" ] && [ -f /run/usb-mic-links ] && [ -f /run/usb-mic-bcddevice ] \
+        && [ -f /run/usb-mic-names ]; then
+    mkdir -p "$STATE/saved"
+    cp /run/usb-mic-links "$STATE/saved/links"
+    cp /run/usb-mic-bcddevice "$STATE/saved/bcdDevice"
+    cp /run/usb-mic-names "$STATE/saved/names"
+fi
+rm -f /run/usb-mic-links /run/usb-mic-bcddevice /run/usb-mic-names
+
 cd "$G"
 udc=$(cat UDC)
 [ -n "$udc" ] || udc=$(ls /sys/class/udc | head -n1)
+[ -n "$udc" ] || fail "no USB device controller"
 
-# Whatever happens below, leave USB bound, or the phone drops off the PC.
-trap '[ -n "$(cat UDC)" ] || echo "$udc" > UDC' EXIT
+# A configfs function name, as linked into the config: "acm.0", "rndis.usb0".
+valid_function() {
+    case "$1" in
+        ""|*/*|.*|*..*) return 1 ;;
+    esac
+    printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_]+\.[A-Za-z0-9_.-]+$' && [ -d "functions/$1" ]
+}
+
+links_now() {
+    for f in configs/c.1/*.*; do
+        [ -L "$f" ] || continue
+        basename "$(readlink "$f")"
+    done
+}
 
 unlink_mic() {
     for f in configs/c.1/uac*.mic; do [ -L "$f" ] && rm "$f"; done
@@ -31,44 +71,81 @@ unlink_mic() {
     return 0
 }
 
+unbind() {
+    [ -z "$(cat UDC)" ] && return 0
+    echo "" > UDC || fail "couldn't unbind USB"
+}
+
+# Put the phone's own setup back from a saved state directory ($1).
+restore_from() {
+    unlink_mic
+    for f in configs/c.1/*.*; do [ -L "$f" ] && rm "$f"; done
+    while read -r f; do
+        valid_function "$f" || { echo "usb-mic-helper: skipping bad saved function '$f'" >&2; continue; }
+        ln -s "functions/$f" configs/c.1/
+    done < "$1/links"
+    cat "$1/bcdDevice" > bcdDevice
+    { read -r product; read -r serial; } < "$1/names"
+    printf '%s\n' "$product" > strings/0x409/product
+    printf '%s\n' "$serial" > strings/0x409/serialnumber
+}
+
+snapshot_to() {
+    mkdir -p "$1"
+    links_now > "$1/links"
+    cat bcdDevice > "$1/bcdDevice"
+    { cat strings/0x409/product; cat strings/0x409/serialnumber; } > "$1/names"
+}
+
+# Whatever happens, end bound: on failure first put the snapshot of this run back.
+done_ok=0
+finish() {
+    if [ "$done_ok" != 1 ] && [ -d "$STATE/now" ]; then
+        [ -z "$(cat UDC)" ] && restore_from "$STATE/now" 2>/dev/null || true
+    fi
+    [ -n "$(cat UDC)" ] || echo "$udc" > UDC || echo "usb-mic-helper: couldn't rebind USB" >&2
+    rm -rf "$STATE/now"
+}
+trap finish EXIT
+trap 'exit 1' INT TERM HUP
+
+rm -rf "$STATE/now"
+snapshot_to "$STATE/now"
+
 case "$1" in
 on)
-    echo "" > UDC || true
+    # The phone's own setup, saved once: a second "on" keeps the first snapshot.
+    [ -d "$STATE/saved" ] || cp -a "$STATE/now" "$STATE/saved"
+    unbind
     unlink_mic
+    # Other functions come off while the headset is on: on this kernel the serial
+    # port carries an IAD and UAC1 doesn't, and Windows then splits the headset's
+    # interfaces apart and fails to start it (problem code 10).
+    for f in configs/c.1/*.*; do [ -L "$f" ] && rm "$f"; done
     mkdir "$F"
-    # p_* is the phone's playback, which the PC sees as a microphone. The c_* side
-    # (a PC speaker) stays on with one channel: with it off, this kernel advertises
-    # a broken endpoint.
+    # p_* is the phone's playback, which the PC sees as a microphone. c_* is the
+    # PC's speaker, which the phone can listen to or record; both stereo.
+    # (With c_* off, this kernel advertises a broken endpoint anyway.)
     echo 3 > "$F/p_chmask"; echo 48000 > "$F/p_srate"; echo 2 > "$F/p_ssize"
-    echo 1 > "$F/c_chmask"; echo 48000 > "$F/c_srate"; echo 2 > "$F/c_ssize"
-    if [ ! -f "$LINKS" ]; then
-        for f in configs/c.1/*.*; do [ -L "$f" ] && basename "$f"; done > "$LINKS"
-    fi
-    while read -r f; do rm -f "configs/c.1/$f"; done < "$LINKS"
+    echo 3 > "$F/c_chmask"; echo 48000 > "$F/c_srate"; echo 2 > "$F/c_ssize"
     ln -s "$F" configs/c.1/
-    [ -f "$SAVED" ] || cat bcdDevice > "$SAVED"
-    [ -f "$NAMES" ] || { cat strings/0x409/product; cat strings/0x409/serialnumber; } > "$NAMES"
-    echo "$MIC_PRODUCT" > strings/0x409/product
-    echo "$MIC_SERIAL" > strings/0x409/serialnumber
+    printf '%s\n' "$MIC_PRODUCT" > strings/0x409/product
+    printf '%s\n' "$MIC_SERIAL" > strings/0x409/serialnumber
     echo "$MIC_BCD" > bcdDevice
     echo "$udc" > UDC
     ;;
 off)
-    echo "" > UDC || true
-    unlink_mic
-    if [ -f "$LINKS" ]; then
-        while read -r f; do [ -e "configs/c.1/$f" ] || ln -s "functions/$f" configs/c.1/; done < "$LINKS"
-        rm -f "$LINKS"
-    fi
-    if [ -f "$SAVED" ]; then cat "$SAVED" > bcdDevice; rm -f "$SAVED"; fi
-    if [ -f "$NAMES" ]; then
-        { read -r product; read -r serial; } < "$NAMES"
-        echo "$product" > strings/0x409/product
-        echo "$serial" > strings/0x409/serialnumber
-        rm -f "$NAMES"
+    unbind
+    if [ -d "$STATE/saved" ]; then
+        restore_from "$STATE/saved"
+    else
+        unlink_mic
     fi
     echo "$udc" > UDC
+    # Only now that the phone is back is the saved setup no longer needed.
+    rm -rf "$STATE/saved"
     ;;
 *)
     echo "usage: $0 on|off" >&2; exit 2 ;;
 esac
+done_ok=1

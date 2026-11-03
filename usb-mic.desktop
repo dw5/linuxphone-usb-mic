@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=USB Mic
-Comment=Play music and sound effects into a PC as a USB microphone
-Exec=/home/furios/.local/bin/usb-mic
+Comment=Use the phone as a USB headset for a PC: play into it, or record from it
+Exec=usb-mic
 Icon=usb-mic
 Terminal=false
 Categories=AudioVideo;Audio;

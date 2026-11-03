@@ -1,6 +1,7 @@
 #!/usr/bin/python3
-"""USB Mic: the phone appears to a plugged-in PC as a microphone and speaker. Play music
-or sound effects into it, talk through it, and listen to the PC on the phone."""
+"""USB Mic: the phone appears to a plugged-in PC as a USB headset. Into the PC: play
+music or sound effects, or talk through the phone. From the PC: listen on the phone, or
+record whatever the PC plays."""
 import json
 import os
 import shutil
@@ -20,18 +21,41 @@ HELPER = "/usr/local/libexec/usb-mic-helper"
 GADGET_LINK = "/sys/kernel/config/usb_gadget/g1/configs/c.1/uac1.mic"
 SOUNDS = Path.home() / "Music" / "Soundboard"
 CONFIG = Path(GLib.get_user_config_dir()) / "usb-mic.json"
+RECORDINGS = Path(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_MUSIC)
+                  or Path.home() / "Music") / "PC recordings"
 AUDIO = (".mp3", ".ogg", ".oga", ".opus", ".wav", ".flac", ".m4a", ".aac")
 
 
 def pactl(*args):
-    return subprocess.run(["pactl", *args], capture_output=True, text=True).stdout.strip()
-
-
-def devices(kind):
+    """Run pactl and return its output; "" if it fails or PulseAudio doesn't answer
+    within 3 s (this runs on the GTK thread, so it must not hang)."""
     try:
-        return json.loads(pactl("-f", "json", "list", kind) or "[]")
-    except ValueError:
-        return []
+        return subprocess.run(["pactl", *args], capture_output=True, text=True,
+                              timeout=3).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+_devices = {}  # kind -> (when, list): one refresh asks PulseAudio once per kind
+
+
+def devices(kind, fresh=False):
+    when, found = _devices.get(kind, (0.0, []))
+    if fresh or time.monotonic() - when > 0.5:
+        try:
+            found = json.loads(pactl("-f", "json", "list", kind) or "[]")
+        except ValueError:
+            found = []
+        _devices[kind] = (time.monotonic(), found)
+    return found
+
+
+def make(factory):
+    """A GStreamer element, or an error naming the missing plugin."""
+    e = Gst.ElementFactory.make(factory, None)
+    if e is None:
+        raise RuntimeError(f"GStreamer element \"{factory}\" is missing")
+    return e
 
 
 def is_gadget(dev):
@@ -81,7 +105,7 @@ def choices(kind):
 
 
 def active_port(kind, device):
-    return next((d.get("active_port") for d in devices(kind) if d["name"] == device), None)
+    return next((d.get("active_port") for d in devices(kind, fresh=True) if d["name"] == device), None)
 
 
 def timecode(ns):
@@ -105,6 +129,7 @@ class Window(Adw.ApplicationWindow):
         self.effects = {}       # player -> (to the PC, on the phone) volumes, None for previews
         self.talk = None
         self.listen = None
+        self.rec = None          # while recording: pipeline, file, sound received
         self.last_seek = 0.0
         self.music_want = False  # what the play button last asked for
         self.ending = {}         # player -> when it was first seen at its end
@@ -114,23 +139,62 @@ class Window(Adw.ApplicationWindow):
         except (OSError, ValueError):
             self.saved = {}
 
-        # Microphone
-        self.mic = Adw.SwitchRow(title="Microphone for the PC")
+        # The USB connection
+        self.mic = Adw.SwitchRow(title="USB headset for the PC")
         self.mic.connect("notify::active", self.on_mic)
         self.talk_row = Adw.SwitchRow(title="Talk through the phone",
                                       subtitle="The phone's microphone goes to the PC")
         self.talk_row.connect("notify::active", self.on_talk)
+        # How loud your voice is, from the phone's microphone (RMS, -60..0 dB): yellow
+        # is quiet, green is speech, and the bar turns red when peaks get near clipping.
+        self.meter = Gtk.LevelBar(min_value=0, max_value=1, hexpand=True, valign=Gtk.Align.CENTER)
+        for name in ("low", "high", "full"):
+            self.meter.remove_offset_value(name)
+        self.meter.add_offset_value("low", 1 / 3)  # below -40 dB
+        self.meter.add_offset_value("high", 1.0)
+        self.meter.add_css_class("talk-meter")
+        self.level_at = 0.0   # when the last reading came in
+        self.clip_until = 0.0
+        meter_box = Gtk.Box(margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+        meter_box.append(self.meter)
+        self.meter_row = Adw.PreferencesRow(activatable=False, child=meter_box, visible=False)
+        css = Gtk.CssProvider()
+        css.load_from_string(
+            "levelbar.talk-meter block.low { background-color: var(--warning-bg-color); }"
+            "levelbar.talk-meter block.high { background-color: var(--success-bg-color); }"
+            "levelbar.talk-meter.clipping block.filled { background-color: var(--error-bg-color); }"
+            "levelbar.talk-meter trough { min-height: 10px; }")
+        Gtk.StyleContext.add_provider_for_display(self.get_display(), css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         self.monitor = Adw.SwitchRow(title="Hear it on the phone",
                                      subtitle="Music and sound effects also play here")
         self.monitor.connect("notify::active", lambda *_: self.apply_outputs())
+        conn_group = Adw.PreferencesGroup(
+            description="Plug the phone into a PC by USB and turn this on. On the PC, pick "
+                        "\"Terminal Headset\" as the microphone, the speaker, or both.")
+        conn_group.add(self.mic)
+        talk_group = Adw.PreferencesGroup()
+        for r in (self.talk_row, self.meter_row, self.monitor):
+            talk_group.add(r)
+
+        # From the PC
         self.listen_row = Adw.SwitchRow(title="Listen to the PC",
-                                        subtitle="Sound the PC plays to this device comes out here")
+                                        subtitle="What the PC plays comes out of the phone")
         self.listen_row.connect("notify::active", self.on_listen)
-        mic_group = Adw.PreferencesGroup(
-            description="Plug the phone into a PC by USB, then pick \"Terminal Headset\" "
-                        "on the PC as its microphone, and as its speaker to listen here.")
-        for r in (self.mic, self.talk_row, self.listen_row, self.monitor):
-            mic_group.add(r)
+        self.rec_row = Adw.ActionRow(title="Record the PC",
+                                     subtitle="Saves what the PC plays, as FLAC")
+        self.rec_btn = Gtk.Button(icon_name="media-record-symbolic", valign=Gtk.Align.CENTER,
+                                  tooltip_text="Start or stop recording")
+        self.rec_btn.add_css_class("circular")
+        self.rec_btn.connect("clicked", self.toggle_record)
+        self.rec_row.add_suffix(self.rec_btn)
+        folder_row = Adw.ActionRow(title="Recordings", subtitle=str(RECORDINGS), activatable=True)
+        folder_row.add_suffix(Gtk.Image(icon_name="folder-open-symbolic"))
+        folder_row.connect("activated", lambda *_: self.open_recordings())
+        from_group = Adw.PreferencesGroup(
+            description="On the PC, pick \"Terminal Headset\" as the speaker.")
+        for r in (self.listen_row, self.rec_row, folder_row):
+            from_group.add(r)
 
         # Phone's own microphone and speaker
         self.pickers = {}
@@ -206,12 +270,34 @@ class Window(Adw.ApplicationWindow):
         self.hint.add_css_class("caption")
         board_group.add(self.hint)
 
-        page = Adw.PreferencesPage()
-        for g in (mic_group, dev_group, music_group, board_group):
-            page.add(g)
-        self.toasts = Adw.ToastOverlay(child=page)
+        # Two tabs: into the PC (fake microphone) and from the PC (listen, record).
+        stack = Adw.ViewStack(vexpand=True)
+        into = Adw.PreferencesPage()
+        for g in (talk_group, music_group, board_group):
+            into.add(g)
+        stack.add_titled_with_icon(into, "into", "Into the PC", "audio-input-microphone-symbolic")
+        from_page = Adw.PreferencesPage()
+        from_page.add(from_group)
+        stack.add_titled_with_icon(from_page, "from", "From the PC", "audio-speakers-symbolic")
+
+        # The phone's own microphone and speaker live in a dialog behind a header button.
+        self.devices_dialog = Adw.PreferencesDialog(title="Phone audio")
+        dev_page = Adw.PreferencesPage()
+        dev_page.add(dev_group)
+        self.devices_dialog.add(dev_page)
+        dev_btn = Gtk.Button(icon_name="emblem-system-symbolic", tooltip_text="Phone audio")
+        dev_btn.connect("clicked", lambda *_: self.devices_dialog.present(self))
+
+        header = Adw.HeaderBar(title_widget=Adw.ViewSwitcher(
+            stack=stack, policy=Adw.ViewSwitcherPolicy.WIDE))
+        header.pack_start(dev_btn)
+        conn = Adw.Clamp(child=conn_group, margin_start=12, margin_end=12, margin_top=12)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        body.append(conn)
+        body.append(stack)
+        self.toasts = Adw.ToastOverlay(child=body)
         view = Adw.ToolbarView(content=self.toasts)
-        view.add_top_bar(Adw.HeaderBar())
+        view.add_top_bar(header)
         self.set_content(view)
 
         self.load_board()
@@ -226,6 +312,7 @@ class Window(Adw.ApplicationWindow):
         self.stop_effects()
         self.stop_talk()
         self.stop_listen()
+        self.stop_record(wait=True)
         self.restore_ports()
         return False
 
@@ -253,13 +340,14 @@ class Window(Adw.ApplicationWindow):
                     self.drop_effect(pb)
             self.stop_talk()
             self.stop_listen()
+            self.stop_record()
         self.syncing = True
         self.mic.set_active(on)
         self.talk_row.set_active(self.talk is not None)
         self.listen_row.set_active(self.listen is not None)
         self.syncing = False
-        self.talk_row.set_sensitive(bool(self.sink))
-        self.listen_row.set_sensitive(bool(self.sink))
+        for w in (self.talk_row, self.listen_row, self.rec_btn):
+            w.set_sensitive(bool(self.sink))
         if not on:
             self.mic.set_subtitle("Off")
         elif self.sink:
@@ -276,20 +364,29 @@ class Window(Adw.ApplicationWindow):
             self.stop_effects()
             self.stop_talk()
             self.stop_listen()
+            self.stop_record()
         self.busy = True
         row.set_sensitive(False)
         row.set_subtitle("Turning on…" if want else "Turning off…")
         # Plugging the microphone in makes PulseAudio switch the phone's own default
         # speaker and microphone to it, so note them now and put them back after.
         defaults = (pactl("get-default-sink"), pactl("get-default-source"))
-        proc = Gio.Subprocess.new(["pkexec", HELPER, "on" if want else "off"],
-                                  Gio.SubprocessFlags.STDERR_PIPE)
-        proc.communicate_utf8_async(None, None, self.mic_done, want, defaults)
+        try:
+            proc = Gio.Subprocess.new(["pkexec", HELPER, "on" if want else "off"],
+                                      Gio.SubprocessFlags.STDERR_PIPE)
+            proc.communicate_utf8_async(None, None, self.mic_done, want, defaults)
+        except GLib.Error as e:
+            self.toast(f"Couldn't run the helper: {e.message[:80]}")
+            self.finish_mic()
 
     def mic_done(self, proc, result, want, defaults):
-        _, _, err = proc.communicate_utf8_finish(result)
-        if not proc.get_successful():
-            self.toast(f"Couldn't change the microphone: {(err or '').strip()[:80]}")
+        try:
+            _, _, err = proc.communicate_utf8_finish(result)
+            ok = proc.get_successful()
+        except GLib.Error as e:
+            ok, err = False, e.message
+        if not ok:
+            self.toast(f"Couldn't change the USB headset: {(err or '').strip()[:80]}")
             self.finish_mic()
             return
         if want:
@@ -299,17 +396,17 @@ class Window(Adw.ApplicationWindow):
             self.finish_mic()
 
     def restore_defaults(self, defaults):
-        """Wait for PulseAudio to pick up the microphone, then undo its default switch."""
+        """Wait for PulseAudio to pick up the headset, then undo its switch of the phone's
+        defaults to it. Only defaults now pointing at the headset are changed back."""
         sink = gadget_sink()
         self.restore_tries -= 1
         if not sink and self.restore_tries > 0:
             return GLib.SOURCE_CONTINUE
-        sink_was, source_was = defaults
-        gadget = {d["name"] for kind in ("sinks", "sources") for d in devices(kind) if is_gadget(d)}
-        if sink_was and sink_was not in gadget and pactl("get-default-sink") != sink_was:
-            pactl("set-default-sink", sink_was)
-        if source_was and source_was not in gadget and pactl("get-default-source") != source_was:
-            pactl("set-default-source", source_was)
+        gadget = {d["name"] for kind in ("sinks", "sources") for d in devices(kind, fresh=True)
+                  if is_gadget(d)}
+        for kind, was in zip(("sink", "source"), defaults):
+            if was and was not in gadget and pactl(f"get-default-{kind}") in gadget:
+                pactl(f"set-default-{kind}", was)
         self.finish_mic()
         return GLib.SOURCE_REMOVE
 
@@ -356,7 +453,7 @@ class Window(Adw.ApplicationWindow):
     def use_choice(self, kind):
         """Switch the port if needed, then move whatever is playing or listening."""
         device, port = self.choice(kind)
-        self.restore_ports(keep=(kind, device))
+        self.restore_ports(kind, keep=device)
         if port and active_port(kind, device) != port:
             self.ports_was.setdefault((kind, device), active_port(kind, device))
             pactl(f"set-{kind[:-1]}-port", device, port)
@@ -371,38 +468,66 @@ class Window(Adw.ApplicationWindow):
             self.stop_talk()
             self.start_talk()
 
-    def restore_ports(self, keep=None):
-        """Put back ports this app changed, apart from the one still in use."""
+    def restore_ports(self, only_kind=None, keep=None):
+        """Put back ports this app changed: all of them, or those of one kind apart
+        from the device still in use."""
         for (kind, device), port in list(self.ports_was.items()):
-            if (kind, device) != keep:
-                if port:
-                    pactl(f"set-{kind[:-1]}-port", device, port)
-                del self.ports_was[(kind, device)]
+            if only_kind and (kind != only_kind or device == keep):
+                continue
+            if port:
+                pactl(f"set-{kind[:-1]}-port", device, port)
+            del self.ports_was[(kind, device)]
 
     # Playback
 
     def player(self, path, volume=1.0, to_pc=True):
-        """A playbin for a file. Its sound goes to the PC and, muted unless asked for,
+        """A player for a file. Its sound goes to the PC and, muted unless asked for,
         to the phone's own speaker; with to_pc False only to the phone.
         Returns (player, outputs): outputs is (volume to the PC or None, volume on the
-        phone, the phone's sink element)."""
+        phone, the phone's sink element, master volume)."""
         if to_pc and not self.sink:
-            self.toast("Turn the microphone on first")
+            self.toast("Turn the USB headset on first")
             return None, None
-        out = Gst.Bin.new(None)
-        tee = Gst.ElementFactory.make("tee", None)
-        out.add(tee)
-        out.add_pad(Gst.GhostPad.new("sink", tee.get_static_pad("sink")))
+        try:
+            return self.build_player(path, volume, to_pc)
+        except RuntimeError as e:
+            self.toast(f"Can't play: {e}")
+            return None, None
+
+    def build_player(self, path, volume, to_pc):
+        # Not playbin: it hands its volume to whichever volume-capable element it finds
+        # in a custom sink, which here was the phone's muted side, so the slider did nothing.
+        out = Gst.Pipeline.new(None)
+        dec = make("uridecodebin")
+        dec.set_property("uri", Gio.File.new_for_path(str(path)).get_uri())
+        conv = make("audioconvert")
+        res = make("audioresample")
+        master = make("volume")
+        master.set_property("volume", volume)
+        tee = make("tee")
+        for e in (dec, conv, res, master, tee):
+            out.add(e)
+        conv.link(res)
+        res.link(master)
+        master.link(tee)
+
+        def on_pad(_dec, pad):
+            # Take the first audio stream; ignore cover art and the like.
+            caps = pad.get_current_caps() or pad.query_caps(None)
+            sinkpad = conv.get_static_pad("sink")
+            if caps.get_structure(0).get_name().startswith("audio/") and not sinkpad.is_linked():
+                pad.link(sinkpad)
+        dec.connect("pad-added", on_pad)
 
         def branch(device, gadget):
             # The PC side stalls while the PC isn't recording. A leaky queue drops sound
             # there instead of holding up the phone side and the position.
-            q = Gst.ElementFactory.make("queue", None)
+            q = make("queue")
             if gadget:
                 q.set_property("leaky", 2)  # downstream: drop the oldest
                 q.set_property("max-size-time", 200 * Gst.MSECOND)
-            vol = Gst.ElementFactory.make("volume", None)
-            sink = Gst.ElementFactory.make("pulsesink", None)
+            vol = make("volume")
+            sink = make("pulsesink")
             if device:
                 sink.set_property("device", device)
             if gadget:
@@ -418,18 +543,14 @@ class Window(Adw.ApplicationWindow):
 
         pc = branch(self.sink, True)[0] if to_pc else None
         local, local_sink = branch(self.choice("sinks")[0], False)
-        pb = Gst.ElementFactory.make("playbin", None)
-        pb.set_property("audio-sink", out)
-        pb.set_property("video-sink", Gst.ElementFactory.make("fakesink", None))
-        pb.set_property("uri", Gio.File.new_for_path(str(path)).get_uri())
-        pb.set_property("volume", volume)
+        pb = out
         # Run on the system clock, so a stalled PC side can't stop time for everything.
         pb.use_clock(Gst.SystemClock.obtain())
         bus = pb.get_bus()
         bus.add_signal_watch()
         bus.connect("message::eos", self.on_end, pb)
         bus.connect("message::error", self.on_error, pb)
-        return pb, (pc, local, local_sink)
+        return pb, (pc, local, local_sink, master)
 
     def apply_outputs(self):
         """Play on the phone too, or not, to match the switch. Previews always do."""
@@ -524,6 +645,17 @@ class Window(Adw.ApplicationWindow):
 
     def update_position(self):
         self.check_ends()
+        if self.rec:
+            r = self.rec
+            try:
+                size = r["path"].stat().st_size / 1e6
+            except OSError:
+                size = 0
+            quiet = time.monotonic() - r["last"] > 1.0
+            self.rec_row.set_subtitle(f"Recording {timecode(r['ns'])} · {size:.1f} MB"
+                                      + (" · no sound from the PC" if quiet else ""))
+        if self.talk and time.monotonic() - self.level_at > 0.5:
+            self.meter.set_value(0)  # no readings: don't leave a stale level up
         # Leave the slider alone just after a drag, until the seek has landed.
         if self.music and time.monotonic() - self.last_seek > 0.5:
             ok, dur = self.music.query_duration(Gst.Format.TIME)
@@ -548,7 +680,8 @@ class Window(Adw.ApplicationWindow):
         never finishes, because the PC side is stuck. End it a second later instead."""
         now = time.monotonic()
         for pb, out in [(self.music, self.music_out), *self.effects.items()]:
-            if not pb:
+            if not pb or (pb is self.music and not self.music_want):
+                self.ending.pop(pb, None)
                 continue
             ok_d, dur = pb.query_duration(Gst.Format.TIME)
             ok_p, pos = self.position_of(pb, out)
@@ -567,13 +700,14 @@ class Window(Adw.ApplicationWindow):
                                       int(value * Gst.SECOND)):
             self.toast("Couldn't jump there")
             return True
+        self.ending.pop(self.music, None)
         self.last_seek = time.monotonic()
         self.pos_label.set_label(timecode(int(value * Gst.SECOND)))
         return False
 
     def on_volume(self, scale):
-        if self.music:
-            self.music.set_property("volume", scale.get_value())
+        if self.music_out:
+            self.music_out[3].set_property("volume", scale.get_value())
 
     # Talking
 
@@ -585,26 +719,40 @@ class Window(Adw.ApplicationWindow):
         else:
             self.stop_talk()
 
-    def link(self, source, sink, on_error):
+    def link(self, source, sink, on_error, meter=False):
         """A live pipeline from a PulseAudio source to a sink (None: the phone's default),
-        kept short: a leaky queue drops sound rather than letting the delay grow."""
+        kept short: a leaky queue drops sound rather than letting the delay grow.
+        None if it can't be built."""
+        try:
+            return self.build_link(source, sink, on_error, meter)
+        except RuntimeError as e:
+            self.toast(str(e))
+            return None
+
+    def build_link(self, source, sink, on_error, meter):
         pipe = Gst.Pipeline.new(None)
-        src = Gst.ElementFactory.make("pulsesrc", None)
+        src = make("pulsesrc")
         src.set_property("device", source)
         src.set_property("buffer-time", 40000)   # µs
         src.set_property("latency-time", 10000)
-        q = Gst.ElementFactory.make("queue", None)
+        q = make("queue")
         q.set_property("leaky", 2)
         q.set_property("max-size-time", 100 * Gst.MSECOND)
-        conv = Gst.ElementFactory.make("audioconvert", None)
-        res = Gst.ElementFactory.make("audioresample", None)
-        out = Gst.ElementFactory.make("pulsesink", None)
+        conv = make("audioconvert")
+        res = make("audioresample")
+        out = make("pulsesink")
         if sink:
             out.set_property("device", sink)
         out.set_property("buffer-time", 60000)
         out.set_property("latency-time", 10000)
         out.set_property("sync", False)
         chain = (src, q, conv, res, out)
+        if meter:
+            # Right after the microphone, before the queue: the PC side stalls while the
+            # PC isn't recording, and a meter after it would freeze.
+            level = make("level")
+            level.set_property("interval", 50 * Gst.MSECOND)
+            chain = (src, level, q, conv, res, out)
         for e in chain:
             pipe.add(e)
         for a, b in zip(chain, chain[1:]):
@@ -612,6 +760,8 @@ class Window(Adw.ApplicationWindow):
         bus = pipe.get_bus()
         bus.add_signal_watch()
         bus.connect("message::error", on_error)
+        if meter:
+            bus.connect("message::element", self.on_level)
         pipe.set_state(Gst.State.PLAYING)
         return pipe
 
@@ -624,11 +774,31 @@ class Window(Adw.ApplicationWindow):
     def start_talk(self):
         mic = self.choice("sources")[0] or phone_mic()
         if not self.sink or not mic:
-            self.toast("Turn the microphone on first" if not self.sink
+            self.toast("Turn the USB headset on first" if not self.sink
                        else "Couldn't find the phone's microphone")
             self.switch_off(self.talk_row)
             return
-        self.talk = self.link(mic, self.sink, self.on_talk_error)
+        self.talk = self.link(mic, self.sink, self.on_talk_error, meter=True)
+        if not self.talk:
+            self.switch_off(self.talk_row)
+            return
+        self.meter.set_value(0)
+        self.meter_row.set_visible(True)
+
+    def on_level(self, _bus, msg):
+        st = msg.get_structure()
+        if st.get_name() != "level":
+            return
+        now = time.monotonic()
+        self.level_at = now
+        rms = min(1.0, max(0.0, (max(st.get_value("rms")) + 60) / 60))
+        cur = self.meter.get_value()
+        # Rise at once, fall over about 200 ms: steady to read, still quick.
+        self.meter.set_value(rms if rms >= cur else cur + (rms - cur) * 0.25)
+        if max(st.get_value("peak")) > -3:
+            self.clip_until = now + 1.0
+        if (now < self.clip_until) != self.meter.has_css_class("clipping"):
+            (self.meter.add_css_class if now < self.clip_until else self.meter.remove_css_class)("clipping")
 
     def on_talk_error(self, _bus, msg):
         err, _ = msg.parse_error()
@@ -640,6 +810,7 @@ class Window(Adw.ApplicationWindow):
             self.talk.set_state(Gst.State.NULL)
             self.talk.get_bus().remove_signal_watch()
             self.talk = None
+        self.meter_row.set_visible(False)
         self.switch_off(self.talk_row)
 
     # Listening to the PC
@@ -655,10 +826,12 @@ class Window(Adw.ApplicationWindow):
     def start_listen(self):
         src = gadget_source() if self.sink else None
         if not src:
-            self.toast("Turn the microphone on first")
+            self.toast("Turn the USB headset on first")
             self.switch_off(self.listen_row)
             return
         self.listen = self.link(src, self.choice("sinks")[0], self.on_listen_error)
+        if not self.listen:
+            self.switch_off(self.listen_row)
 
     def on_listen_error(self, _bus, msg):
         err, _ = msg.parse_error()
@@ -671,6 +844,153 @@ class Window(Adw.ApplicationWindow):
             self.listen.get_bus().remove_signal_watch()
             self.listen = None
         self.switch_off(self.listen_row)
+
+    # Recording the PC
+
+    def toggle_record(self, *_):
+        if self.rec:
+            self.stop_record()
+        else:
+            self.start_record()
+
+    def start_record(self):
+        src = gadget_source() if self.sink else None
+        if not src:
+            self.toast("Turn the USB headset on first")
+            return
+        try:
+            path = self.new_recording_file()
+        except OSError as e:
+            self.toast(f"Couldn't create a file in {RECORDINGS}: {e.strerror}")
+            return
+        pipe = Gst.Pipeline.new(None)
+        try:
+            chain = [make(n) for n in
+                     ("pulsesrc", "capsfilter", "queue", "audioconvert", "flacenc", "filesink")]
+        except RuntimeError as e:
+            path.unlink(missing_ok=True)
+            self.toast(f"Can't record: {e}")
+            return
+        src_el, caps, queue, _, enc, sink = chain
+        src_el.set_property("device", src)
+        # What the USB link carries; left open, PulseAudio may hand over less.
+        caps.set_property("caps", Gst.Caps.from_string("audio/x-raw,rate=48000,channels=2"))
+        sink.set_property("location", str(path))
+        rec = {"pipe": pipe, "path": path, "enc": enc, "queue": queue, "ns": 0, "last": 0.0,
+               "stopping": False, "done": False, "timer": 0}
+
+        # Count what actually arrives: the PC only sends sound while it's playing to us.
+        def counted(_pad, info):
+            buf = info.get_buffer()
+            if buf and buf.duration != Gst.CLOCK_TIME_NONE:
+                rec["ns"] += buf.duration
+            rec["last"] = time.monotonic()
+            return Gst.PadProbeReturn.OK
+        src_el.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, counted)
+        for e in chain:
+            pipe.add(e)
+        for a, b in zip(chain, chain[1:]):
+            a.link(b)
+        bus = pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self.on_record_error, rec)
+        bus.connect("message::eos", lambda *_: self.finish_record(rec, True))
+        if pipe.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            pipe.set_state(Gst.State.NULL)
+            bus.remove_signal_watch()
+            path.unlink(missing_ok=True)
+            self.toast("Couldn't start recording")
+            return
+        self.rec = rec
+        self.rec_btn.set_icon_name("media-playback-stop-symbolic")
+        self.rec_btn.add_css_class("destructive-action")
+
+    @staticmethod
+    def new_recording_file():
+        """Reserve a new file, never reusing an existing name."""
+        RECORDINGS.mkdir(parents=True, exist_ok=True)
+        base = time.strftime("PC %Y-%m-%d %H-%M-%S")
+        for n in range(1, 1000):
+            path = RECORDINGS / (f"{base}.flac" if n == 1 else f"{base} ({n}).flac")
+            try:
+                os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+                return path
+            except FileExistsError:
+                continue
+        raise OSError(17, "too many recordings with the same name")
+
+    def on_record_error(self, _bus, msg, rec):
+        err, _ = msg.parse_error()
+        if rec["stopping"]:
+            self.finish_record(rec, False)
+            return
+        self.toast(f"Recording stopped: {err.message[:80]}")
+        self.stop_record(rec)
+
+    def stop_record(self, rec=None, wait=False):
+        """Finish the file properly, so the FLAC header gets its final length. The
+        end-of-stream goes in at the encoder: sent to the pipeline, it waits for the
+        source, which blocks for good while the PC sends nothing. Normally this
+        returns at once and finish_record() follows; with wait (closing), it blocks
+        for up to 2 s."""
+        rec = rec or self.rec
+        if not rec or rec["stopping"]:
+            return
+        rec["stopping"] = True
+        if rec is self.rec:
+            self.rec = None
+            self.rec_btn.set_icon_name("media-record-symbolic")
+            self.rec_btn.remove_css_class("destructive-action")
+            self.rec_row.set_subtitle("Saves what the PC plays, as FLAC")
+
+        def idle(_pad, _info):
+            rec["enc"].get_static_pad("sink").send_event(Gst.Event.new_eos())
+            return Gst.PadProbeReturn.REMOVE
+        rec["queue"].get_static_pad("src").add_probe(Gst.PadProbeType.IDLE, idle)
+        if wait:
+            msg = rec["pipe"].get_bus().timed_pop_filtered(
+                2 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+            self.finish_record(rec, msg is not None and msg.type == Gst.MessageType.EOS)
+        else:
+            rec["timer"] = GLib.timeout_add_seconds(3, self.finish_record, rec, False)
+
+    def finish_record(self, rec, ok):
+        if rec["done"]:
+            return GLib.SOURCE_REMOVE
+        rec["done"] = True
+        if rec["timer"]:
+            GLib.source_remove(rec["timer"])
+            rec["timer"] = 0
+        rec["pipe"].set_state(Gst.State.NULL)
+        rec["pipe"].get_bus().remove_signal_watch()
+        path = rec["path"]
+        if rec["ns"] == 0:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.toast("Nothing recorded: the PC didn't play anything to Terminal Headset")
+            return GLib.SOURCE_REMOVE
+        title = f"Saved {path.name}" if ok else f"Saved {path.name}, but its end may be cut off"
+        toast = Adw.Toast(title=title, button_label="Show")
+        toast.connect("button-clicked", lambda *_: self.open_recordings())
+        self.toasts.add_toast(toast)
+        return GLib.SOURCE_REMOVE
+
+    def open_recordings(self):
+        try:
+            RECORDINGS.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.toast(f"Couldn't make {RECORDINGS}: {e.strerror}")
+            return
+        launcher = Gtk.FileLauncher.new(Gio.File.new_for_path(str(RECORDINGS)))
+
+        def done(lnch, result):
+            try:
+                lnch.launch_finish(result)
+            except GLib.Error as e:
+                self.toast(f"Couldn't open the folder: {e.message[:60]}")
+        launcher.launch(self, None, done)
 
     # Soundboard
 
@@ -699,15 +1019,24 @@ class Window(Adw.ApplicationWindow):
             files = dlg.open_multiple_finish(result)
         except GLib.Error:
             return
-        SOUNDS.mkdir(parents=True, exist_ok=True)
-        added = 0
+        added, failed = 0, 0
         for i in range(files.get_n_items()):
-            src = Path(files.get_item(i).get_path())
-            if src.suffix.lower() in AUDIO and src.parent != SOUNDS:
-                shutil.copy2(src, SOUNDS / src.name)
+            name = files.get_item(i).get_path()
+            src = Path(name) if name else None
+            if not src or src.suffix.lower() not in AUDIO or src.parent == SOUNDS:
+                continue
+            try:
+                SOUNDS.mkdir(parents=True, exist_ok=True)
+                dest, n = SOUNDS / src.name, 2
+                while dest.exists():  # keep both rather than overwrite
+                    dest, n = SOUNDS / f"{src.stem} ({n}){src.suffix}", n + 1
+                shutil.copy2(src, dest)
                 added += 1
+            except OSError:
+                failed += 1
         self.load_board()
-        self.toast(f"Added {added} sound{'s' if added != 1 else ''}")
+        self.toast(f"Added {added} sound{'s' if added != 1 else ''}"
+                   + (f", {failed} couldn't be copied" if failed else ""))
 
     def play_effect(self, _btn, path, to_pc=True):
         pb, out = self.player(path, to_pc=to_pc)
