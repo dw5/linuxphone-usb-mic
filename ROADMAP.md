@@ -71,11 +71,13 @@ canceller lines up; Robot and Cave got headroom.
 
 ## Phase 3: AI voice changer on another machine
 
+On hold (2026-11-03): the user has no machine with a suitable GPU and no server setup
+for it. Keep as a todo; pick it up if that changes.
+
 Too heavy for the phone (RVC-style models want a GPU for real time). The phone streams
 the voice to a server, gets the converted voice back, and sends it into the PC. The PC
 it's plugged into needs no software: a hardware voice changer for locked-down PCs.
 
-- [ ] Ask the user which machine has a usable GPU.
 - [ ] Server: an existing real-time voice changer (e.g. w-okada voice-changer, RVC).
 - [ ] Transport: Opus or PCM over WebSocket or RTP; aim for 0.2 to 0.5 s end to end.
 - [ ] Fallback when the server is unreachable: plain voice, with a notice.
