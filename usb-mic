@@ -57,6 +57,12 @@ EFFECTS = [
                                "upper-frequency=4500 poles=4 ! audioamplify amplification=5 "
                                "clipping-method=clip ! volume volume=0.5"),
 ]
+# Type to speak. Piper (natural voices) if it's installed: the program on PATH or in
+# ~/.local/share/usb-mic/piper/, voices as .onnx files (with their .onnx.json) in
+# ~/.local/share/usb-mic/voices/. eSpeak NG (the espeak-ng package) as the robotic one.
+TTS_HOME = Path(GLib.get_user_data_dir()) / "usb-mic"
+ESPEAK_VOICES = [("en-us", "American"), ("en-gb", "British"), ("en-us+whisper", "Whisper"),
+                 ("en-us+croak", "Croak")]
 ECHO_PROBE = "usb-mic-echo-probe"  # links the listen output to the talk echo canceller
 AUDIO = (".mp3", ".ogg", ".oga", ".opus", ".wav", ".flac", ".m4a", ".aac")
 
@@ -169,6 +175,27 @@ def available_effects():
     return found
 
 
+def tts_voices():
+    """Voices to speak typed text with, as (key, label, command). The command takes the
+    text on stdin and gets the file to write appended."""
+    out = []
+    piper = shutil.which("piper") or (str(TTS_HOME / "piper" / "piper")
+                                      if os.access(TTS_HOME / "piper" / "piper", os.X_OK) else None)
+    if piper:
+        for model in sorted((TTS_HOME / "voices").glob("*.onnx")):
+            if model.with_suffix(".onnx.json").exists():
+                # en_US-lessac-medium -> "Lessac (en_US)"
+                lang, _, rest = model.stem.partition("-")
+                name = rest.rsplit("-", 1)[0].replace("_", " ").title() or model.stem
+                out.append((f"piper:{model.name}", f"{name} ({lang})",
+                            [piper, "--model", str(model), "--output_file"]))
+    espeak = shutil.which("espeak-ng")
+    if espeak:
+        out += [(f"espeak:{v}", f"{label}, robotic", [espeak, "-v", v, "--stdin", "-w"])
+                for v, label in ESPEAK_VOICES]
+    return out
+
+
 def timecode(ns):
     s = max(0, ns) // Gst.SECOND
     return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
@@ -198,6 +225,12 @@ class Window(Adw.ApplicationWindow):
         self.music_want = False  # what the play button last asked for
         self.ending = {}         # player -> when it was first seen at its end
         self.ports_was = {}      # (kind, device) -> port before this app changed it
+        self.talk_gate = None    # mutes the talk pipeline for push-to-talk
+        self.holding = False     # the hold-to-talk button is down
+        self.say_queue = []      # typed lines waiting: (text, to the PC)
+        self.saying = None       # the line in progress: its synthesis (Gio.Subprocess) or player
+        self.saying_file = None  # ... and its file, (path, to the PC)
+        self.temp_files = {}     # player -> spoken file to delete when it's done
         try:
             self.saved = json.loads(CONFIG.read_text())
         except (OSError, ValueError):
@@ -231,6 +264,22 @@ class Window(Adw.ApplicationWindow):
             "levelbar.talk-meter trough { min-height: 10px; }")
         Gtk.StyleContext.add_provider_for_display(self.get_display(), css,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.ptt_row = Adw.SwitchRow(title="Push to talk",
+                                     subtitle="The PC only hears you while you hold the button",
+                                     active=bool(self.saved.get("ptt")))
+        self.ptt_row.connect("notify::active", self.on_ptt)
+        self.hold_btn = Gtk.Button(label="Hold to talk", height_request=72, hexpand=True)
+        self.hold_btn.add_css_class("pill")
+        # A drag gesture, not a click: a click gives up when the finger moves a little,
+        # which would cut you off mid-sentence.
+        hold = Gtk.GestureDrag(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        hold.connect("drag-begin", lambda *_: self.set_holding(True))
+        hold.connect("drag-end", lambda *_: self.set_holding(False))
+        hold.connect("cancel", lambda *_: self.set_holding(False))
+        self.hold_btn.add_controller(hold)
+        hold_box = Gtk.Box(margin_start=12, margin_end=12, margin_top=8, margin_bottom=8)
+        hold_box.append(self.hold_btn)
+        self.hold_row = Adw.PreferencesRow(activatable=False, child=hold_box, visible=False)
         self.monitor = Adw.SwitchRow(title="Hear it on the phone",
                                      subtitle="Music and sound effects also play here")
         self.monitor.connect("notify::active", lambda *_: self.apply_outputs())
@@ -253,9 +302,34 @@ class Window(Adw.ApplicationWindow):
                                       active=bool(self.saved.get("echo")))
         self.echo_row.connect("notify::active", self.on_voice_option, "echo")
         talk_group = Adw.PreferencesGroup()
-        for r in (self.talk_row, self.meter_row, self.effect_row, self.clean_row, self.echo_row,
-                  self.monitor):
+        for r in (self.talk_row, self.meter_row, self.hold_row, self.ptt_row, self.effect_row,
+                  self.clean_row, self.echo_row, self.monitor):
             talk_group.add(r)
+
+        # Type to speak
+        self.tts = tts_voices()
+        self.say_row = Adw.EntryRow(title="Type, then press Enter")
+        self.say_row.connect("entry-activated", lambda *_: self.say_typed(True))
+        say_btn = Gtk.Button(icon_name="media-playback-start-symbolic", valign=Gtk.Align.CENTER,
+                             tooltip_text="Say it to the PC; press and hold to hear it on the phone only")
+        say_btn.add_css_class("flat")
+        say_btn.connect("clicked", lambda *_: self.say_typed(True))
+        say_hold = Gtk.GestureLongPress()
+        say_hold.connect("pressed", self.preview_typed)
+        say_btn.add_controller(say_hold)
+        self.say_row.add_suffix(say_btn)
+        self.voice_row = Adw.ComboRow(title="Voice", model=Gtk.StringList.new([v[1] for v in self.tts]))
+        keys = [v[0] for v in self.tts]
+        if self.saved.get("voice") in keys:
+            self.voice_row.set_selected(keys.index(self.saved["voice"]))
+        self.voice_row.connect("notify::selected", self.on_voice)
+        say_group = Adw.PreferencesGroup(title="Type to speak")
+        if self.tts:
+            say_group.add(self.say_row)
+            say_group.add(self.voice_row)
+        else:
+            say_group.set_description("No voice installed. Install the espeak-ng package, or "
+                                      "Piper for natural voices (see the README).")
 
         # From the PC
         self.listen_row = Adw.SwitchRow(title="Listen to the PC",
@@ -353,7 +427,7 @@ class Window(Adw.ApplicationWindow):
         # Two tabs: into the PC (fake microphone) and from the PC (listen, record).
         stack = Adw.ViewStack(vexpand=True)
         into = Adw.PreferencesPage()
-        for g in (talk_group, music_group, board_group):
+        for g in (talk_group, say_group, music_group, board_group):
             into.add(g)
         stack.add_titled_with_icon(into, "into", "Into the PC", "audio-input-microphone-symbolic")
         from_page = Adw.PreferencesPage()
@@ -389,6 +463,7 @@ class Window(Adw.ApplicationWindow):
 
     def on_close(self, *_):
         self.close_music()
+        self.stop_speech()
         self.stop_effects()
         self.stop_talk()
         self.stop_listen()
@@ -402,6 +477,10 @@ class Window(Adw.ApplicationWindow):
     # Microphone
 
     def tick(self):
+        if self.holding:
+            # pactl runs on this thread; while it waits, letting go of the button
+            # wouldn't be noticed and the PC would keep hearing you.
+            return GLib.SOURCE_CONTINUE
         self.refresh_choices()
         self.refresh()
         return GLib.SOURCE_CONTINUE
@@ -415,6 +494,7 @@ class Window(Adw.ApplicationWindow):
             # The microphone went away: nothing can reach the PC any more.
             if self.music:
                 self.close_music()
+            self.stop_speech(pc_only=True)
             for pb, out in list(self.effects.items()):
                 if out[0] is not None:
                     self.drop_effect(pb)
@@ -441,6 +521,7 @@ class Window(Adw.ApplicationWindow):
         want = row.get_active()
         if not want:
             self.close_music()
+            self.stop_speech()
             self.stop_effects()
             self.stop_talk()
             self.stop_listen()
@@ -603,10 +684,16 @@ class Window(Adw.ApplicationWindow):
         def branch(device, gadget):
             # The PC side stalls while the PC isn't recording. A leaky queue drops sound
             # there instead of holding up the phone side and the position.
+            # While starting (and after a pause or seek) both sinks wait for the player to
+            # be ready, and the decoder fills the queues meanwhile. The phone's queue has
+            # to fill up first and hold the decoder back, otherwise the PC's leaky queue
+            # throws away the start: it lost the first second of every sound.
             q = make("queue")
+            q.set_property("max-size-buffers", 0)
+            q.set_property("max-size-bytes", 0)
+            q.set_property("max-size-time", (500 if gadget else 200) * Gst.MSECOND)
             if gadget:
                 q.set_property("leaky", 2)  # downstream: drop the oldest
-                q.set_property("max-size-time", 200 * Gst.MSECOND)
             vol = make("volume")
             sink = make("pulsesink")
             if device:
@@ -857,6 +944,10 @@ class Window(Adw.ApplicationWindow):
                 if cancel:
                     dsp.set_property("probe", ECHO_PROBE)
                 chain.append(dsp)
+            # Push-to-talk mutes here, before the effect, so an echo can ring out.
+            self.talk_gate = make("volume")
+            self.talk_gate.set_property("mute", self.ptt_row.get_active() and not self.holding)
+            chain.append(self.talk_gate)
             self.talk_effect = self.effect_bin()
             chain += [self.talk_effect, make("audioconvert"), make("audioresample")]
         chain.append(out)
@@ -897,6 +988,7 @@ class Window(Adw.ApplicationWindow):
             return
         self.meter.set_value(0)
         self.meter_row.set_visible(True)
+        self.apply_gate()
 
     def restart_talk(self):
         """Rebuild the talk pipeline with the current options, if talking."""
@@ -949,10 +1041,18 @@ class Window(Adw.ApplicationWindow):
             pad.remove_probe(probe_id)
             self.toast(f"Can't use that effect: {e.message[:60]}")
             return GLib.SOURCE_REMOVE
+        # Bin.add returns None or True depending on the PyGObject version; it raises
+        # when it fails, so check where the bin ended up instead.
         ok = (after is not None
               and pad.unlink(old.get_static_pad("sink"))
-              and old.get_static_pad("src").unlink(after)
-              and pipe.add(new) is None
+              and old.get_static_pad("src").unlink(after))
+        if ok:
+            try:
+                pipe.add(new)
+            except Exception:
+                pass
+            ok = new.get_parent() is pipe
+        ok = (ok
               and pad.link(new.get_static_pad("sink")) == Gst.PadLinkReturn.OK
               and new.get_static_pad("src").link(after) == Gst.PadLinkReturn.OK
               and new.sync_state_with_parent())
@@ -998,8 +1098,35 @@ class Window(Adw.ApplicationWindow):
             self.talk.set_state(Gst.State.NULL)
             self.talk.get_bus().remove_signal_watch()
             self.talk = None
+        self.talk_gate = None
+        self.holding = False
         self.meter_row.set_visible(False)
+        self.apply_gate()
         self.switch_off(self.talk_row)
+
+    # Push to talk
+
+    def on_ptt(self, row, _param):
+        self.saved["ptt"] = row.get_active()
+        self.save_settings()
+        self.apply_gate()
+
+    def set_holding(self, down):
+        self.holding = down
+        self.apply_gate()
+
+    def apply_gate(self):
+        """Open the microphone to the PC unless push-to-talk is on and the button is up."""
+        ptt = self.ptt_row.get_active()
+        open_ = not ptt or self.holding
+        if self.talk_gate:
+            self.talk_gate.set_property("mute", not open_)
+        self.hold_row.set_visible(ptt and self.talk is not None)
+        self.hold_btn.set_label("Talking…" if self.holding else "Hold to talk")
+        (self.hold_btn.add_css_class if self.holding and self.talk
+         else self.hold_btn.remove_css_class)("destructive-action")
+        self.talk_row.set_subtitle("Muted until you hold the button" if self.talk and not open_
+                                   else "The phone's microphone goes to the PC")
 
     # Listening to the PC
 
@@ -1236,6 +1363,7 @@ class Window(Adw.ApplicationWindow):
             self.effects[pb] = out
             self.apply_outputs()
             pb.set_state(Gst.State.PLAYING)
+        return pb
 
     def preview_effect(self, gesture, _x, _y, path):
         # Claiming the press stops the button from also sending it to the PC.
@@ -1249,10 +1377,102 @@ class Window(Adw.ApplicationWindow):
         pb.get_bus().remove_signal_watch()
         del self.effects[pb]
         self.ending.pop(pb, None)
+        path = self.temp_files.pop(pb, None)
+        if path:
+            path.unlink(missing_ok=True)
+        if pb is self.saying:
+            self.saying = None
+            self.saying_file = None
+            self.say_next()
 
     def stop_effects(self):
+        self.stop_speech()
         for pb in list(self.effects):
             self.drop_effect(pb)
+
+    # Type to speak: lines are spoken one after another, like soundboard sounds.
+
+    def on_voice(self, row, _param):
+        self.saved["voice"] = self.tts[row.get_selected()][0]
+        self.save_settings()
+
+    def say_typed(self, to_pc):
+        text = " ".join(self.say_row.get_text().split())
+        if not text or not self.tts:
+            return
+        if to_pc and not self.sink:
+            self.toast("Turn the USB headset on first")
+            return
+        self.say_row.set_text("")
+        self.say_queue.append((text, to_pc))
+        self.say_next()
+
+    def preview_typed(self, gesture, *_):
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)  # not to the PC as well
+        self.say_typed(False)
+
+    def say_next(self):
+        if self.saying or not self.say_queue:
+            return
+        text, to_pc = self.say_queue.pop(0)
+        voice = self.tts[self.voice_row.get_selected()] if self.tts else None
+        if not voice:
+            return
+        path = None
+        try:
+            fd, name = GLib.file_open_tmp("usb-mic-say-XXXXXX.wav")
+            os.close(fd)
+            path = Path(name)
+            proc = Gio.Subprocess.new([*voice[2], name], Gio.SubprocessFlags.STDIN_PIPE
+                                      | Gio.SubprocessFlags.STDOUT_SILENCE
+                                      | Gio.SubprocessFlags.STDERR_PIPE)
+        except GLib.Error as e:
+            if path:
+                path.unlink(missing_ok=True)
+            self.toast(f"Couldn't speak: {e.message[:80]}")
+            self.say_queue.clear()
+            return
+        self.saying = proc
+        self.saying_file = (path, to_pc)
+        proc.communicate_utf8_async(text + "\n", None, self.said, path, to_pc)
+
+    def said(self, proc, result, path, to_pc):
+        try:
+            _, _, err = proc.communicate_utf8_finish(result)
+            ok = proc.get_successful() and path.stat().st_size > 44
+        except (GLib.Error, OSError) as e:
+            ok, err = False, str(e)
+        if proc is not self.saying:  # stopped meanwhile
+            path.unlink(missing_ok=True)
+            return
+        self.saying = None
+        self.saying_file = None
+        pb = self.play_effect(None, path, to_pc) if ok else None
+        if not pb:
+            if not ok:
+                self.toast(f"Couldn't speak: {(err or '').strip()[:80]}")
+            path.unlink(missing_ok=True)
+            self.say_next()
+            return
+        self.temp_files[pb] = path
+        self.saying = pb
+        self.saying_file = (path, to_pc)
+
+    def stop_speech(self, pc_only=False):
+        """Forget waiting lines and stop the one being made or spoken. With pc_only
+        (the headset went away), lines for the phone only carry on."""
+        self.say_queue[:] = [q for q in self.say_queue if pc_only and not q[1]]
+        if self.saying is None or (pc_only and not self.saying_file[1]):
+            return
+        saying, self.saying = self.saying, None
+        path, _ = self.saying_file
+        self.saying_file = None
+        if isinstance(saying, Gio.Subprocess):
+            saying.force_exit()
+            path.unlink(missing_ok=True)  # now: on close, said() may never run
+        else:
+            self.drop_effect(saying)
+        self.say_next()
 
 
 class App(Adw.Application):

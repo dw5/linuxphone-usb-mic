@@ -83,10 +83,34 @@ it's plugged into needs no software: a hardware voice changer for locked-down PC
 - [ ] Fallback when the server is unreachable: plain voice, with a notice.
 - [ ] Voices: generic or the user's own models, not imitations of real people.
 
+## Type to speak and push to talk (done 2026-11-03)
+
+- [x] **Push to talk**: a mute in the talk pipeline, before the effect (an echo can ring
+      out), opened by a big hold button. A drag gesture, not a click, so moving the finger
+      doesn't cut you off. Tested: silence on the PC muted, the tone while held.
+- [x] **Type to speak** with eSpeak NG (`espeak-ng` installed on `testdom`, 15 ms per
+      line) or Piper if present. Lines queue and play through the soundboard player.
+      Tested: two lines in order on the PC, stop cuts the current one and drops the rest,
+      preview on the phone only, temp files removed.
+- [ ] Piper on the phone: untested. Running the downloaded release binary was blocked in
+      the session; the user can install it (see README) and try a voice.
+- [x] Found while testing: the PC missed the first second of every sound (soundboard,
+      music start, after pause or seek). Fixed by queue sizes in `build_player`.
+- [ ] Left: about 0.3 s missing at the end of a track replayed after a seek (seen with a
+      2 s test tone). Not the rewind; cause unknown.
+- [x] Codex review, fixed: push-to-talk started unmuted for a moment (the gate is now
+      muted before the pipeline starts); the 2 s refresh cancelled phone-only lines while
+      the headset was off; temp files left on close or failed launch; the live effect swap
+      relied on `Bin.add` returning None (True on other PyGObject versions, which would have
+      restarted talk on every change).
+- [ ] From the same review: a blocking `pactl` could delay noticing the button's release.
+      The 2 s refresh now skips while the button is held; the real fix is the asynchronous
+      PulseAudio client under Technical debt.
+- [ ] Ideas: recent lines to say again with one tap; a voice effect on the typed voice;
+      a hardware key or Bluetooth button for push to talk.
+
 ## Later ideas
 
-- [ ] Type to speak: text to speech (Piper runs on phones) straight into the PC.
-- [ ] Push-to-talk: a big hold-to-talk button.
 - [ ] Effects volume (soundboard has no volume of its own).
 - [ ] Recording: also record your own side (mic going to the PC) as a second track.
 - [ ] Sound effects triggered by your voice (e.g. a laugh track after you stop).

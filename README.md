@@ -11,7 +11,11 @@ The phone shows up as a USB headset ("Terminal Headset") on the PC it's plugged 
     - **Talk through the phone** sends the phone's own microphone to the PC. A bar under it shows how loud your voice is, straight from the phone's microphone: empty in silence, yellow when quiet (below -40 dB), green for speech, and red for a second when peaks get near clipping.
     - **Voice effect** for talking: None, Deep, Chipmunk, Higher and Lower (natural), Robot, Dalek, Cave, Hall, Phone call, Walkie-talkie, Megaphone. Higher, Lower and Dalek, and the better Robot, need `swh-plugins` and `rubberband-ladspa`; without them they're left out (Robot falls back to a rougher version). Changes take effect while you talk, without a break. The meter still shows your own voice, before the effect.
     - **Clean up my voice**: WebRTC noise suppression. **Cancel echo**: WebRTC echo cancelling against what **Listen to the PC** plays, for talking and listening on the phone's speaker. No automatic gain: you set your own level.
+    - **Push to talk**: the PC only hears the microphone while you hold the big **Hold to talk** button. The meter keeps showing your voice either way.
     - **Hear it on the phone** also plays music and effects on the phone, including while you talk.
+    - **Type to speak**: type a line and press Enter, and a voice says it to the PC. Lines are spoken one after another; the soundboard's stop button stops them. Press and hold the play button to hear a line on the phone only. Voices:
+      - eSpeak NG (`sudo apt install espeak-ng`): American, British, Whisper and Croak. Robotic, but instant.
+      - Piper, for natural voices. Not packaged in Debian: put the `piper` program on PATH or in `~/.local/share/usb-mic/piper/` (the `piper_linux_aarch64` release from github.com/rhasspy/piper), and voices (each `.onnx` with its `.onnx.json`, from huggingface.co/rhasspy/piper-voices) in `~/.local/share/usb-mic/voices/`. Untested on the phone so far.
     - Press and hold a soundboard button to hear that sound on the phone only.
   - **From the PC** (pick "Terminal Headset" as the PC's speaker; stereo, 48 kHz)
     - The PC's own volume for "Terminal Headset" sets the level. PipeWire starts a new device at 40% (about -24 dB): set it to 100% so recordings get the PC's sound unchanged.
@@ -27,6 +31,8 @@ The phone shows up as a USB headset ("Terminal Headset") on the PC it's plugged 
 While the mic is on it is the gadget's only function, and the device reports product "Terminal Headset", serial `TH0001`, `bcdDevice` 0x0305. On this kernel the CDC ACM function has an IAD and f_uac1 doesn't, and Windows then splits the mic's interfaces and fails to start it. `off` restores the earlier functions, names and `bcdDevice`.
 
 Tested 2026-11-03: Linux (PipeWire) and Windows 10 22H2 (usbaudio) both record a clean 440 Hz tone.
+
+Fixed 2026-11-03: the PC missed the first second of every sound (soundboard, music start, after a pause or seek). While the player starts, the phone's queue held a second of sound and the PC's 200 ms leaky queue dropped the rest; the phone's queue is now the smaller one.
 
 Known: sound only reaches the PC while it's recording. The app drops sound rather than queueing it, so music keeps time and effects don't pile up; enabling the gadget makes PulseAudio switch the phone's own defaults to it, which the app undoes for any default still pointing at the gadget; Windows names the input "Capture Input terminal", fixed in this kernel's f_uac1.
 
