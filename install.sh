@@ -12,4 +12,8 @@ sed "s|^Exec=.*|Exec=$HOME/.local/bin/usb-mic|" usb-mic.desktop > ~/.local/share
 install -D -m 644 usb-mic.svg ~/.local/share/icons/hicolor/scalable/apps/usb-mic.svg
 gtk-update-icon-cache -q ~/.local/share/icons/hicolor 2>/dev/null || true
 update-desktop-database -q ~/.local/share/applications 2>/dev/null || true
+# Starter soundboard. Files already there, or deleted on purpose and replaced by
+# something with the same name, are left alone.
+mkdir -p ~/Music/Soundboard
+cp -n sounds/* ~/Music/Soundboard/
 echo "Installed. Look for \"USB Mic\" in the app list."

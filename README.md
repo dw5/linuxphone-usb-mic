@@ -25,7 +25,8 @@ The phone shows up as a USB headset ("Terminal Headset") on the PC it's plugged 
   - A USB dock or USB headset adapter can't be used at the same time: the phone's single USB-C port is either a device for the PC or a host for the dock, not both.
   - Talking and listening on the phone's speaker at once loops the PC's sound back through the phone's microphone. Use the earpiece or a headset.
 - `usb-mic-helper`: root helper, run through polkit (`local.usbmic.policy`). `on` adds a UAC1 function to the running gadget `g1`; `off` removes it. Nothing persists across a reboot. Each run takes a lock, snapshots the gadget first, stops if USB can't be unbound, and on any failure puts the snapshot back and rebinds. The phone's own setup is kept in root-only `/run/usb-mic/` until `off` has put it back.
-- `install.sh`: installs both for the current user.
+- `install.sh`: installs both for the current user, and puts a starter soundboard in `~/Music/Soundboard` (never overwriting): Applause, Audience laugh, Ba-dum-tss, Cha-ching, Drum roll, Sad trombone.
+- `sounds/`: that starter soundboard, from Wikimedia Commons. Authors and licenses (CC0, CC BY, CC BY-SA, public domain) are in `sounds/CREDITS.txt`.
 - `dev/`: scripts used while working this out. Not part of the app; see `dev/README.md`.
 
 While the mic is on it is the gadget's only function, and the device reports product "Terminal Headset", serial `TH0001`, `bcdDevice` 0x0305. On this kernel the CDC ACM function has an IAD and f_uac1 doesn't, and Windows then splits the mic's interfaces and fails to start it. `off` restores the earlier functions, names and `bcdDevice`.
