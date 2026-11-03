@@ -23,6 +23,27 @@ SOUNDS = Path.home() / "Music" / "Soundboard"
 CONFIG = Path(GLib.get_user_config_dir()) / "usb-mic.json"
 RECORDINGS = Path(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_MUSIC)
                   or Path.home() / "Music") / "PC recordings"
+# Voice effects for talking: (key, name, GStreamer elements). All from GStreamer's good
+# and bad plugin sets, which FuriOS installs. Delays are in nanoseconds.
+EFFECTS = [
+    ("none", "None", "identity"),
+    ("deep", "Deep", "pitch pitch=0.75"),
+    ("chipmunk", "Chipmunk", "pitch pitch=1.6"),
+    # A very short echo fed back into itself rings like metal.
+    ("robot", "Robot", "pitch pitch=0.92 ! audioecho max-delay=20000000 delay=7000000 "
+                       "intensity=0.65 feedback=0.65"),
+    ("cave", "Cave", "audioecho max-delay=500000000 delay=230000000 intensity=0.45 feedback=0.4"),
+    ("hall", "Hall", "freeverb room-size=0.85 damping=0.3 level=0.45"),
+    ("phone", "Phone call", "audiochebband mode=band-pass lower-frequency=400 "
+                            "upper-frequency=3400 poles=4"),
+    ("walkie", "Walkie-talkie", "audiochebband mode=band-pass lower-frequency=500 "
+                                "upper-frequency=2600 poles=4 ! audioamplify amplification=3 "
+                                "clipping-method=clip ! volume volume=0.6"),
+    ("megaphone", "Megaphone", "audiochebband mode=band-pass lower-frequency=700 "
+                               "upper-frequency=4500 poles=4 ! audioamplify amplification=5 "
+                               "clipping-method=clip ! volume volume=0.5"),
+]
+ECHO_PROBE = "usb-mic-echo-probe"  # links the listen output to the talk echo canceller
 AUDIO = (".mp3", ".ogg", ".oga", ".opus", ".wav", ".flac", ".m4a", ".aac")
 
 
@@ -139,6 +160,7 @@ class Window(Adw.ApplicationWindow):
         self.music_out = None   # (to the PC, on the phone) volume elements
         self.effects = {}       # player -> (to the PC, on the phone) volumes, None for previews
         self.talk = None
+        self.talk_effect = None  # the effect bin inside the talk pipeline
         self.listen = None
         self.rec = None          # while recording: pipeline, file, sound received
         self.last_seek = 0.0
@@ -184,8 +206,23 @@ class Window(Adw.ApplicationWindow):
             description="Plug the phone into a PC by USB and turn this on. On the PC, pick "
                         "\"Terminal Headset\" as the microphone, the speaker, or both.")
         conn_group.add(self.mic)
+        self.effect_row = Adw.ComboRow(title="Voice effect",
+                                       model=Gtk.StringList.new([e[1] for e in EFFECTS]))
+        keys = [e[0] for e in EFFECTS]
+        self.effect_row.set_selected(keys.index(self.saved.get("effect", "none"))
+                                     if self.saved.get("effect") in keys else 0)
+        self.effect_row.connect("notify::selected", self.on_effect)
+        self.clean_row = Adw.SwitchRow(title="Clean up my voice",
+                                       subtitle="Cuts background noise",
+                                       active=bool(self.saved.get("clean")))
+        self.clean_row.connect("notify::active", self.on_voice_option, "clean")
+        self.echo_row = Adw.SwitchRow(title="Cancel echo",
+                                      subtitle="When listening to the PC on the phone's speaker",
+                                      active=bool(self.saved.get("echo")))
+        self.echo_row.connect("notify::active", self.on_voice_option, "echo")
         talk_group = Adw.PreferencesGroup()
-        for r in (self.talk_row, self.meter_row, self.monitor):
+        for r in (self.talk_row, self.meter_row, self.effect_row, self.clean_row, self.echo_row,
+                  self.monitor):
             talk_group.add(r)
 
         # From the PC
@@ -459,10 +496,7 @@ class Window(Adw.ApplicationWindow):
             return
         items = self.pickers[kind][1]
         self.saved[kind] = items[row.get_selected()][0]
-        try:
-            CONFIG.write_text(json.dumps(self.saved))
-        except OSError:
-            pass
+        self.save_settings()
         self.use_choice(kind)
 
     def use_choice(self, kind):
@@ -734,17 +768,17 @@ class Window(Adw.ApplicationWindow):
         else:
             self.stop_talk()
 
-    def link(self, source, sink, on_error, meter=False):
+    def link(self, source, sink, on_error, meter=False, talk=False, probe=False):
         """A live pipeline from a PulseAudio source to a sink (None: the phone's default),
         kept short: a leaky queue drops sound rather than letting the delay grow.
         None if it can't be built."""
         try:
-            return self.build_link(source, sink, on_error, meter)
-        except RuntimeError as e:
+            return self.build_link(source, sink, on_error, meter, talk, probe)
+        except (RuntimeError, GLib.Error) as e:
             self.toast(str(e))
             return None
 
-    def build_link(self, source, sink, on_error, meter):
+    def build_link(self, source, sink, on_error, meter, talk, probe):
         pipe = Gst.Pipeline.new(None)
         src = make("pulsesrc")
         src.set_property("device", source)
@@ -761,13 +795,38 @@ class Window(Adw.ApplicationWindow):
         out.set_property("buffer-time", 60000)
         out.set_property("latency-time", 10000)
         out.set_property("sync", False)
-        chain = (src, q, conv, res, out)
+        chain = [src, q, conv, res]
         if meter:
             # Right after the microphone, before the queue: the PC side stalls while the
-            # PC isn't recording, and a meter after it would freeze.
+            # PC isn't recording, and a meter after it would freeze. It measures your
+            # own voice, before any effect: "am I loud enough".
             level = make("level")
             level.set_property("interval", 50 * Gst.MSECOND)
-            chain = (src, level, q, conv, res, out)
+            chain.insert(1, level)
+        if talk or probe:
+            # WebRTC processing wants a fixed rate and 16-bit samples, on both sides.
+            caps = make("capsfilter")
+            caps.set_property("caps", Gst.Caps.from_string("audio/x-raw,format=S16LE,rate=48000"))
+            chain.append(caps)
+        if probe:
+            # What the phone plays, for the talk side's echo canceller to subtract.
+            echo = make("webrtcechoprobe")
+            echo.set_property("name", ECHO_PROBE)
+            chain += [echo, make("audioconvert")]
+        if talk:
+            clean = self.clean_row.get_active()
+            cancel = self.echo_row.get_active() and self.listen is not None
+            if clean or cancel:
+                dsp = make("webrtcdsp")
+                dsp.set_property("noise-suppression", clean)
+                dsp.set_property("echo-cancel", cancel)
+                dsp.set_property("gain-control", False)  # the user sets their own level
+                dsp.set_property("delay-agnostic", True)
+                if cancel:
+                    dsp.set_property("probe", ECHO_PROBE)
+                chain.append(dsp)
+            chain += [self.effect_bin(), make("audioconvert"), make("audioresample")]
+        chain.append(out)
         for e in chain:
             pipe.add(e)
         for a, b in zip(chain, chain[1:]):
@@ -793,12 +852,72 @@ class Window(Adw.ApplicationWindow):
                        else "Couldn't find the phone's microphone")
             self.switch_off(self.talk_row)
             return
-        self.talk = self.link(mic, self.sink, self.on_talk_error, meter=True)
+        self.talk = self.link(mic, self.sink, self.on_talk_error, meter=True, talk=True)
         if not self.talk:
             self.switch_off(self.talk_row)
             return
         self.meter.set_value(0)
         self.meter_row.set_visible(True)
+
+    def restart_talk(self):
+        """Rebuild the talk pipeline with the current options, if talking."""
+        if not self.talk:
+            return
+        self.talk.set_state(Gst.State.NULL)
+        self.talk.get_bus().remove_signal_watch()
+        self.talk = None
+        self.start_talk()
+
+    def on_voice_option(self, row, _param, key):
+        self.saved[key] = row.get_active()
+        self.save_settings()
+        self.restart_talk()
+
+    def effect_bin(self):
+        desc = EFFECTS[self.effect_row.get_selected()][2]
+        # audioconvert both sides: pitch, for one, only takes floating-point samples.
+        self.talk_effect = Gst.parse_bin_from_description(f"audioconvert ! {desc} ! audioconvert", True)
+        return self.talk_effect
+
+    def on_effect(self, row, _param):
+        self.saved["effect"] = EFFECTS[row.get_selected()][0]
+        self.save_settings()
+        if not self.talk:
+            return
+        # Swap the effect in place while you talk: wait until no sound is passing the
+        # point before it, then unlink the old one and link the new one.
+        pipe = self.talk
+        old = self.talk_effect
+        try:
+            new = self.effect_bin()
+        except GLib.Error as e:
+            self.toast(f"Can't use that effect: {e.message[:60]}")
+            return
+        before = old.get_static_pad("sink").get_peer()
+        after = old.get_static_pad("src").get_peer()
+
+        def swap(pad, _info):
+            pad.unlink(old.get_static_pad("sink"))
+            old.get_static_pad("src").unlink(after)
+            pipe.add(new)
+            pad.link(new.get_static_pad("sink"))
+            new.get_static_pad("src").link(after)
+            new.sync_state_with_parent()
+            GLib.idle_add(self.drop_element, pipe, old)
+            return Gst.PadProbeReturn.REMOVE
+        before.add_probe(Gst.PadProbeType.IDLE, swap)
+
+    @staticmethod
+    def drop_element(pipe, element):
+        element.set_state(Gst.State.NULL)
+        pipe.remove(element)
+        return GLib.SOURCE_REMOVE
+
+    def save_settings(self):
+        try:
+            CONFIG.write_text(json.dumps(self.saved))
+        except OSError:
+            pass
 
     def on_level(self, _bus, msg):
         st = msg.get_structure()
@@ -844,9 +963,11 @@ class Window(Adw.ApplicationWindow):
             self.toast("Turn the USB headset on first")
             self.switch_off(self.listen_row)
             return
-        self.listen = self.link(src, self.speaker(), self.on_listen_error)
+        self.listen = self.link(src, self.speaker(), self.on_listen_error, probe=True)
         if not self.listen:
             self.switch_off(self.listen_row)
+        elif self.echo_row.get_active():
+            self.restart_talk()  # now there's an echo to cancel
 
     def on_listen_error(self, _bus, msg):
         err, _ = msg.parse_error()
@@ -858,6 +979,8 @@ class Window(Adw.ApplicationWindow):
             self.listen.set_state(Gst.State.NULL)
             self.listen.get_bus().remove_signal_watch()
             self.listen = None
+            if self.echo_row.get_active():
+                self.restart_talk()  # its echo canceller lost what it listened to
         self.switch_off(self.listen_row)
 
     # Recording the PC

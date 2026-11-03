@@ -29,20 +29,24 @@ The app has two uses (see `README.md`):
 - [ ] An hour of music into the PC: any dropouts from clock drift? (Codex estimate:
       possibly after about 30 minutes.)
 
-## Phase 1: voice effects on the phone (in progress)
+## Phase 1: voice effects on the phone (done 2026-11-03)
 
-Everything here is already installed on the phone (GStreamer good/bad), low delay.
+Everything here is already installed on the phone (GStreamer good/bad).
 
-- [ ] Effect picker under **Talk through the phone**: None, Deep, Chipmunk, Robot
-      (rough: pitch + short metallic echo), Cave (echo), Hall (reverb), Phone call /
-      radio (band-pass), Megaphone (band-pass + drive).
-- [ ] Switching effect while talking, without a gap or restart if possible.
-- [ ] **Clean up my voice**: WebRTC noise suppression (`webrtcdsp`).
-- [ ] **Echo cancelling** for talk plus listen on the speaker (`webrtcdsp` with
-      `webrtcechoprobe` on the listen output).
-- [ ] Meter keeps measuring the voice going to the PC (after effects) or the raw mic?
-      Decide; raw mic answers "am I loud enough".
-- [ ] Measure the added delay of each effect.
+- [x] Effect picker under **Talk through the phone**: None, Deep, Chipmunk, Robot
+      (rough: pitch + short metallic echo), Cave, Hall, Phone call, Walkie-talkie,
+      Megaphone. Tested: a 400 Hz tone reached the PC at 300 Hz (Deep), 640 Hz
+      (Chipmunk), 368 Hz (Robot).
+- [x] Switching effect while talking swaps it in place, no restart or gap.
+- [x] **Clean up my voice**: WebRTC noise suppression (`webrtcdsp`), no auto gain.
+- [x] **Echo cancelling**: `webrtcdsp` with a `webrtcechoprobe` in the listen output;
+      on only while listening. Starting or stopping listening rebuilds the talk side.
+- [x] The meter measures the raw microphone ("am I loud enough"), before effects.
+- [ ] Delay per effect: unmeasured. The pipeline latency query reads 0 because the PC
+      output doesn't sync to the clock; needs a click-through measurement.
+- [ ] Does echo cancelling actually help on the speaker? Needs a real try.
+- [ ] Test note: `webrtcdsp` stalled with an 8 kHz null-sink monitor as the test
+      "microphone", but works with the real one.
 
 ## Phase 2: better effects with small packages
 
