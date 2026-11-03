@@ -1,0 +1,321 @@
+#!/usr/bin/python3
+"""USB Mic: the phone appears to a plugged-in PC as a microphone. Play music or
+sound effects into it from the phone."""
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+gi.require_version("Gst", "1.0")
+from gi.repository import Adw, Gio, GLib, Gst, Gtk  # noqa: E402
+
+HELPER = "/usr/local/libexec/usb-mic-helper"
+GADGET_LINK = "/sys/kernel/config/usb_gadget/g1/configs/c.1/uac1.mic"
+SOUNDS = Path.home() / "Music" / "Soundboard"
+AUDIO = (".mp3", ".ogg", ".oga", ".opus", ".wav", ".flac", ".m4a", ".aac")
+
+
+def pactl(*args):
+    return subprocess.run(["pactl", *args], capture_output=True, text=True).stdout.strip()
+
+
+def gadget_sink():
+    """PulseAudio's name for the microphone's sink, or None."""
+    try:
+        sinks = json.loads(pactl("-f", "json", "list", "sinks") or "[]")
+    except ValueError:
+        return None
+    for s in sinks:
+        if "Gadget" in (s.get("properties", {}).get("alsa.card_name") or ""):
+            return s["name"]
+    return None
+
+
+def mic_on():
+    return os.path.lexists(GADGET_LINK)
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="USB Mic", default_width=360, default_height=640)
+        self.syncing = False
+        self.busy = False
+        self.sink = None
+        self.music = None
+        self.music_file = None
+        self.effects = set()
+
+        # Microphone
+        self.mic = Adw.SwitchRow(title="Microphone for the PC")
+        self.mic.connect("notify::active", self.on_mic)
+        mic_group = Adw.PreferencesGroup(
+            description="Plug the phone into a PC by USB. The PC must be recording from "
+                        "\"FLX1s\" for sound to play.")
+        mic_group.add(self.mic)
+
+        # Music
+        self.music_row = Adw.ActionRow(title="No file chosen")
+        pick = Gtk.Button(icon_name="document-open-symbolic", valign=Gtk.Align.CENTER,
+                          tooltip_text="Choose a file")
+        pick.connect("clicked", self.pick_music)
+        self.play_btn = Gtk.Button(icon_name="media-playback-start-symbolic", valign=Gtk.Align.CENTER,
+                                   tooltip_text="Play or pause")
+        self.play_btn.connect("clicked", self.toggle_music)
+        stop = Gtk.Button(icon_name="media-playback-stop-symbolic", valign=Gtk.Align.CENTER,
+                          tooltip_text="Stop")
+        stop.connect("clicked", lambda *_: self.stop_music())
+        for b in (pick, self.play_btn, stop):
+            b.add_css_class("flat")
+            self.music_row.add_suffix(b)
+        self.volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 0.05)
+        self.volume.set_value(0.8)
+        self.volume.set_hexpand(True)
+        self.volume.connect("value-changed", self.on_volume)
+        vol_row = Adw.ActionRow(title="Music volume")
+        vol_row.add_suffix(self.volume)
+        music_group = Adw.PreferencesGroup(title="Music")
+        music_group.add(self.music_row)
+        music_group.add(vol_row)
+
+        # Soundboard
+        add = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Add sounds")
+        add.add_css_class("flat")
+        add.connect("clicked", self.add_sounds)
+        stop_fx = Gtk.Button(icon_name="media-playback-stop-symbolic", tooltip_text="Stop sound effects")
+        stop_fx.add_css_class("flat")
+        stop_fx.connect("clicked", lambda *_: self.stop_effects())
+        head = Gtk.Box(spacing=4)
+        head.append(add)
+        head.append(stop_fx)
+        board_group = Adw.PreferencesGroup(title="Soundboard", header_suffix=head)
+        self.grid = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
+                                max_children_per_line=3, min_children_per_line=2,
+                                row_spacing=8, column_spacing=8)
+        board_group.add(self.grid)
+        self.empty = Gtk.Label(label=f"No sounds yet. Tap + to add some.\nThey're kept in {SOUNDS}.",
+                               wrap=True, justify=Gtk.Justification.CENTER)
+        self.empty.add_css_class("dim-label")
+        board_group.add(self.empty)
+
+        page = Adw.PreferencesPage()
+        for g in (mic_group, music_group, board_group):
+            page.add(g)
+        self.toasts = Adw.ToastOverlay(child=page)
+        view = Adw.ToolbarView(content=self.toasts)
+        view.add_top_bar(Adw.HeaderBar())
+        self.set_content(view)
+
+        self.load_board()
+        self.refresh()
+        GLib.timeout_add_seconds(2, self.tick)
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text))
+
+    # Microphone
+
+    def tick(self):
+        self.refresh()
+        return GLib.SOURCE_CONTINUE
+
+    def refresh(self):
+        if self.busy:
+            return
+        on = mic_on()
+        self.sink = gadget_sink() if on else None
+        self.syncing = True
+        self.mic.set_active(on)
+        self.syncing = False
+        if not on:
+            self.mic.set_subtitle("Off")
+        elif self.sink:
+            self.mic.set_subtitle("On: the PC sees \"FLX1s\"")
+        else:
+            self.mic.set_subtitle("On, waiting for the phone's sound system")
+
+    def on_mic(self, row, _param):
+        if self.syncing or self.busy:
+            return
+        want = row.get_active()
+        if not want:
+            self.stop_music()
+            self.stop_effects()
+        self.busy = True
+        row.set_sensitive(False)
+        row.set_subtitle("Turning on…" if want else "Turning off…")
+        # Plugging the microphone in makes PulseAudio switch the phone's own default
+        # speaker and microphone to it, so note them now and put them back after.
+        defaults = (pactl("get-default-sink"), pactl("get-default-source"))
+        proc = Gio.Subprocess.new(["pkexec", HELPER, "on" if want else "off"],
+                                  Gio.SubprocessFlags.STDERR_PIPE)
+        proc.communicate_utf8_async(None, None, self.mic_done, want, defaults)
+
+    def mic_done(self, proc, result, want, defaults):
+        _, _, err = proc.communicate_utf8_finish(result)
+        if not proc.get_successful():
+            self.toast(f"Couldn't change the microphone: {(err or '').strip()[:80]}")
+            self.finish_mic()
+            return
+        if want:
+            self.restore_tries = 10
+            GLib.timeout_add(500, self.restore_defaults, defaults)
+        else:
+            self.finish_mic()
+
+    def restore_defaults(self, defaults):
+        """Wait for PulseAudio to pick up the microphone, then undo its default switch."""
+        sink = gadget_sink()
+        self.restore_tries -= 1
+        if not sink and self.restore_tries > 0:
+            return GLib.SOURCE_CONTINUE
+        sink_was, source_was = defaults
+        if sink_was and "Gadget" not in sink_was and sink_was != sink:
+            pactl("set-default-sink", sink_was)
+        if source_was and source_was != pactl("get-default-source") and "usb0" not in source_was:
+            pactl("set-default-source", source_was)
+        self.finish_mic()
+        return GLib.SOURCE_REMOVE
+
+    def finish_mic(self):
+        self.busy = False
+        self.mic.set_sensitive(True)
+        self.refresh()
+
+    # Playback
+
+    def player(self, path, volume=1.0):
+        if not self.sink:
+            self.toast("Turn the microphone on first")
+            return None
+        pb = Gst.ElementFactory.make("playbin", None)
+        out = Gst.ElementFactory.make("pulsesink", None)
+        out.set_property("device", self.sink)
+        pb.set_property("audio-sink", out)
+        pb.set_property("video-sink", Gst.ElementFactory.make("fakesink", None))
+        pb.set_property("uri", Gio.File.new_for_path(str(path)).get_uri())
+        pb.set_property("volume", volume)
+        bus = pb.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::eos", self.on_end, pb)
+        bus.connect("message::error", self.on_error, pb)
+        return pb
+
+    def on_end(self, _bus, _msg, pb):
+        if pb is self.music:
+            self.stop_music()
+        else:
+            self.drop_effect(pb)
+
+    def on_error(self, _bus, msg, pb):
+        err, _ = msg.parse_error()
+        self.toast(f"Couldn't play: {err.message[:80]}")
+        self.on_end(None, None, pb)
+
+    def pick_music(self, *_):
+        dlg = Gtk.FileDialog(title="Choose music")
+        dlg.open(self, None, self.music_chosen)
+
+    def music_chosen(self, dlg, result):
+        try:
+            f = dlg.open_finish(result)
+        except GLib.Error:
+            return
+        self.stop_music()
+        self.music_file = f.get_path()
+        self.music_row.set_title(GLib.markup_escape_text(Path(self.music_file).name))
+
+    def toggle_music(self, *_):
+        if self.music:
+            _, state, _ = self.music.get_state(0)
+            if state == Gst.State.PLAYING:
+                self.music.set_state(Gst.State.PAUSED)
+                self.play_btn.set_icon_name("media-playback-start-symbolic")
+            else:
+                self.music.set_state(Gst.State.PLAYING)
+                self.play_btn.set_icon_name("media-playback-pause-symbolic")
+            return
+        if not self.music_file:
+            self.pick_music()
+            return
+        self.music = self.player(self.music_file, self.volume.get_value())
+        if self.music:
+            self.music.set_state(Gst.State.PLAYING)
+            self.play_btn.set_icon_name("media-playback-pause-symbolic")
+
+    def stop_music(self):
+        if self.music:
+            self.music.set_state(Gst.State.NULL)
+            self.music.get_bus().remove_signal_watch()
+            self.music = None
+        self.play_btn.set_icon_name("media-playback-start-symbolic")
+
+    def on_volume(self, scale):
+        if self.music:
+            self.music.set_property("volume", scale.get_value())
+
+    # Soundboard
+
+    def load_board(self):
+        while (child := self.grid.get_first_child()):
+            self.grid.remove(child)
+        files = sorted(p for p in SOUNDS.glob("*") if p.suffix.lower() in AUDIO) if SOUNDS.is_dir() else []
+        for p in files:
+            b = Gtk.Button(label=p.stem)
+            b.get_child().set_ellipsize(3)  # Pango.EllipsizeMode.END
+            b.set_size_request(-1, 64)
+            b.connect("clicked", self.play_effect, p)
+            self.grid.append(b)
+        self.empty.set_visible(not files)
+
+    def add_sounds(self, *_):
+        dlg = Gtk.FileDialog(title="Add sounds")
+        dlg.open_multiple(self, None, self.sounds_chosen)
+
+    def sounds_chosen(self, dlg, result):
+        try:
+            files = dlg.open_multiple_finish(result)
+        except GLib.Error:
+            return
+        SOUNDS.mkdir(parents=True, exist_ok=True)
+        added = 0
+        for i in range(files.get_n_items()):
+            src = Path(files.get_item(i).get_path())
+            if src.suffix.lower() in AUDIO and src.parent != SOUNDS:
+                shutil.copy2(src, SOUNDS / src.name)
+                added += 1
+        self.load_board()
+        self.toast(f"Added {added} sound{'s' if added != 1 else ''}")
+
+    def play_effect(self, _btn, path):
+        pb = self.player(path)
+        if pb:
+            self.effects.add(pb)
+            pb.set_state(Gst.State.PLAYING)
+
+    def drop_effect(self, pb):
+        pb.set_state(Gst.State.NULL)
+        pb.get_bus().remove_signal_watch()
+        self.effects.discard(pb)
+
+    def stop_effects(self):
+        for pb in list(self.effects):
+            self.drop_effect(pb)
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="local.UsbMic")
+
+    def do_activate(self):
+        (self.props.active_window or Window(self)).present()
+
+
+if __name__ == "__main__":
+    Gst.init(None)
+    sys.exit(App().run(sys.argv))

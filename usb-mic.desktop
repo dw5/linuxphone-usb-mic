@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=USB Mic
+Comment=Play music and sound effects into a PC as a USB microphone
+Exec=/home/furios/.local/bin/usb-mic
+Icon=usb-mic
+Terminal=false
+Categories=AudioVideo;Audio;
+X-Purism-FormFactor=Workstation;Mobile;
