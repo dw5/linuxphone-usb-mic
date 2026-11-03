@@ -12,6 +12,7 @@ The phone shows up as a USB headset ("Terminal Headset") on the PC it's plugged 
     - **Hear it on the phone** also plays music and effects on the phone, including while you talk.
     - Press and hold a soundboard button to hear that sound on the phone only.
   - **From the PC** (pick "Terminal Headset" as the PC's speaker; stereo, 48 kHz)
+    - The PC's own volume for "Terminal Headset" sets the level. PipeWire starts a new device at 40% (about -24 dB): set it to 100% so recordings get the PC's sound unchanged.
     - **Listen to the PC**: what the PC plays comes out of the phone. With **Talk** as well, a Bluetooth headset on the phone works like one plugged into the PC.
     - **Record the PC**: saves what the PC plays to `~/Music/PC recordings/PC <date> <time>.flac`, 48 kHz stereo. The row shows the length actually received and says when no sound is coming from the PC. A PC only sends while something plays to the device, so silent stretches may be left out. Nothing received means no file.
   - **Phone audio** (gear button) picks the phone's own microphone and speaker: phone's choice, built-in speaker or earpiece, or a Bluetooth headset once connected. Picking the earpiece switches the phone's output port while the app is open and puts it back on close. The choice is saved in `~/.config/usb-mic.json`.

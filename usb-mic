@@ -86,6 +86,17 @@ def phone_mic():
     return mics[0]["name"] if mics else None
 
 
+def phone_speaker():
+    """The phone's own output: the default sink unless that's the USB one (PulseAudio
+    switches the default to it when the headset appears)."""
+    outs = [d for d in devices("sinks") if not is_gadget(d) and is_sound(d)]
+    default = pactl("get-default-sink")
+    for d in outs:
+        if d["name"] == default:
+            return default
+    return outs[0]["name"] if outs else None
+
+
 def choices(kind):
     """The phone's own outputs ("sinks") or inputs ("sources") to pick from, as
     (key, label, device, port). The first entry leaves it to the phone. A device with
@@ -433,6 +444,10 @@ class Window(Adw.ApplicationWindow):
             if not old or key not in keys:
                 self.use_choice(kind)
 
+    def speaker(self):
+        """Where the phone plays: the picked output, or the phone's own default."""
+        return self.choice("sinks")[0] or phone_speaker()
+
     def choice(self, kind):
         """(device, port) picked for "sinks" or "sources"; device None is the phone's choice."""
         row, items = self.pickers[kind]
@@ -460,7 +475,7 @@ class Window(Adw.ApplicationWindow):
         if kind == "sinks":
             for out in [self.music_out, *self.effects.values()]:
                 if out:
-                    out[2].set_property("device", device)
+                    out[2].set_property("device", self.speaker())
             if self.listen:
                 self.stop_listen()
                 self.start_listen()
@@ -542,7 +557,7 @@ class Window(Adw.ApplicationWindow):
             return vol, sink
 
         pc = branch(self.sink, True)[0] if to_pc else None
-        local, local_sink = branch(self.choice("sinks")[0], False)
+        local, local_sink = branch(self.speaker(), False)
         pb = out
         # Run on the system clock, so a stalled PC side can't stop time for everything.
         pb.use_clock(Gst.SystemClock.obtain())
@@ -829,7 +844,7 @@ class Window(Adw.ApplicationWindow):
             self.toast("Turn the USB headset on first")
             self.switch_off(self.listen_row)
             return
-        self.listen = self.link(src, self.choice("sinks")[0], self.on_listen_error)
+        self.listen = self.link(src, self.speaker(), self.on_listen_error)
         if not self.listen:
             self.switch_off(self.listen_row)
 
