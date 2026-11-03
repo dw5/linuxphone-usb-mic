@@ -20,4 +20,11 @@ glkvm uses UAC2 with `c_chmask=0`, on a newer kernel. On this 4.19 kernel, teste
 - `c_chmask=1`: usbaudio2 loads but fails to start, problem 10, status 0xC0440025. The OUT endpoint is async with no feedback endpoint.
 - `c_chmask=0`: same, status 0xC0440022. This kernel still advertises the OUT endpoint, with `wMaxPacketSize` 0.
 
-Both would need f_uac2 changes from newer kernels: dropping the OUT interface when `c_chmask=0`, or a feedback endpoint. UAC1 needs neither. `mic-test.sh` sets up these variants.
+The status codes aren't documented by Microsoft, so these causes come from the descriptors, not the codes. Microsoft does document that its UAC2 driver needs explicit feedback for an async OUT endpoint, and that Windows stops grouping legacy audio interfaces once any IAD is on the device. Both would need f_uac2 changes from newer kernels: dropping the OUT interface when `c_chmask=0`, or a feedback endpoint. UAC1 needs neither. `mic-test.sh` sets up these variants.
+
+## Next steps
+
+- Helper: stop if unbinding fails, snapshot and roll back the whole gadget on error, take a lock, keep state files until restore succeeds, derive the mic serial from the phone's.
+- App: restore only defaults that point at the gadget, don't queue effects while the PC isn't recording, handle helper failures and the mic disappearing, clean up on close, fix the "FLX1s" hint.
+- Check what `usb-config` does to the gadget when switching USB mode in settings.
+- Proper fix for naming and keeping ACM: an out-of-tree module with a patched UAC1/UAC2 function under a new name (IAD, own strings, no OUT endpoint). The kernel takes unsigned modules and `linux-headers-4.19.325-furiphone-radon` is packaged. Idea from a Codex review, 2026-11-03.
