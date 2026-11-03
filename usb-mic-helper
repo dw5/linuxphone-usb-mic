@@ -6,7 +6,7 @@ G=/sys/kernel/config/usb_gadget/g1
 F=functions/uac1.mic
 # Windows caches a device's descriptors by vendor, product and bcdDevice, so a
 # changed set of functions needs its own bcdDevice to be seen (as glkvm does).
-MIC_BCD=0x0303  # each digit 0-9: the kernel rejects others
+MIC_BCD=0x0304  # each digit 0-9: the kernel rejects others
 SAVED=/run/usb-mic-bcddevice
 # Other functions linked before the mic was added. They come off while it's on:
 # on this kernel the serial port carries an IAD and UAC1 doesn't, and Windows then
@@ -14,8 +14,8 @@ SAVED=/run/usb-mic-bcddevice
 LINKS=/run/usb-mic-links
 # Device name and serial shown to the PC while the mic is on (the phone's own
 # include "FLX1s"). The mic's terminal names are fixed in this kernel's f_uac1.
-MIC_PRODUCT="Terminal Microphone"
-MIC_SERIAL="TM0001"
+MIC_PRODUCT="Terminal Headset"
+MIC_SERIAL="TH0001"
 NAMES=/run/usb-mic-names
 [ -d "$G" ] || { echo "no USB gadget g1" >&2; exit 1; }
 cd "$G"

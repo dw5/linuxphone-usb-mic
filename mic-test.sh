@@ -20,7 +20,7 @@ else
     [ "$3" = yes ] && ln -s functions/acm.0 configs/c.1/
     ln -s $F configs/c.1/
     echo "$4" > bcdDevice
-    echo "Terminal Microphone" > strings/0x409/product; echo TM0001 > strings/0x409/serialnumber
+    echo "Terminal Headset" > strings/0x409/product; echo TH0001 > strings/0x409/serialnumber
 fi
 echo "$udc" > UDC
 echo "bcd $(cat bcdDevice) product \"$(cat strings/0x409/product)\" linked: $(ls configs/c.1 | grep '\.' | tr '\n' ' ')"; grep -i gadget /proc/asound/cards || true
