@@ -48,12 +48,26 @@ Everything here is already installed on the phone (GStreamer good/bad).
 - [ ] Test note: `webrtcdsp` stalled with an 8 kHz null-sink monitor as the test
       "microphone", but works with the real one.
 
-## Phase 2: better effects with small packages
+## Phase 2: better effects with small packages (done 2026-11-03)
 
-- [ ] `swh-plugins` (ring modulator): a real robot / Dalek voice.
-- [ ] `rubberband-ladspa`: pitch shift that keeps the voice natural (male to female and
-      back) instead of the chipmunk effect. `librubberband3` is already installed.
-- [ ] Check GStreamer's `ladspa` element picks them up (no ladspa/lv2 elements yet).
+- [x] `swh-plugins` and `rubberband-ladspa` installed on `testdom` (2 packages, nothing
+      removed). GStreamer's `ladspa` element picks up 115 plugins. One plugin crashed
+      GStreamer's plugin scanner (`free(): invalid next size`); the rest registered.
+- [x] **Robot**: ring modulator at 100 Hz plus a short echo. Falls back to the rough
+      pitch-and-echo robot when `swh-plugins` is missing.
+- [x] **Dalek**: ring modulator at 30 Hz.
+- [x] **Higher, natural** / **Lower, natural**: Rubber Band live pitch shifter, +/-4
+      semitones, formant preserving. About 7% of one core. Tested 504 Hz / 317 Hz from 400.
+- [x] Effects needing a missing plugin are left out of the list.
+- [ ] Rubber Band output measured about 10 dB quieter on a test tone; check with a real
+      voice and add make-up gain if needed.
+- [ ] Not on the daily rootfs yet: `install.sh` doesn't install these packages. Decide
+      whether it should (optional, with a prompt).
+
+Codex review of phase 1 (fixed in the same commit): effect swaps now hold the sound with
+a blocking probe and change the graph on the main thread, with each step checked and
+quick picks merged; talk and listen share one clock and time origin so the echo
+canceller lines up; Robot and Cave got headroom.
 
 ## Phase 3: AI voice changer on another machine
 

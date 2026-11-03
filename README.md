@@ -9,7 +9,7 @@ The phone shows up as a USB headset ("Terminal Headset") on the PC it's plugged 
   - **Into the PC**
     - Music has a seek bar with the time and length, and a volume.
     - **Talk through the phone** sends the phone's own microphone to the PC. A bar under it shows how loud your voice is, straight from the phone's microphone: empty in silence, yellow when quiet (below -40 dB), green for speech, and red for a second when peaks get near clipping.
-    - **Voice effect** for talking: None, Deep, Chipmunk, Robot, Cave, Hall, Phone call, Walkie-talkie, Megaphone. Changes take effect while you talk, without a break. The meter still shows your own voice, before the effect.
+    - **Voice effect** for talking: None, Deep, Chipmunk, Higher and Lower (natural), Robot, Dalek, Cave, Hall, Phone call, Walkie-talkie, Megaphone. Higher, Lower and Dalek, and the better Robot, need `swh-plugins` and `rubberband-ladspa`; without them they're left out (Robot falls back to a rougher version). Changes take effect while you talk, without a break. The meter still shows your own voice, before the effect.
     - **Clean up my voice**: WebRTC noise suppression. **Cancel echo**: WebRTC echo cancelling against what **Listen to the PC** plays, for talking and listening on the phone's speaker. No automatic gain: you set your own level.
     - **Hear it on the phone** also plays music and effects on the phone, including while you talk.
     - Press and hold a soundboard button to hear that sound on the phone only.

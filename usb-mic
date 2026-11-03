@@ -23,16 +23,30 @@ SOUNDS = Path.home() / "Music" / "Soundboard"
 CONFIG = Path(GLib.get_user_config_dir()) / "usb-mic.json"
 RECORDINGS = Path(GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_MUSIC)
                   or Path.home() / "Music") / "PC recordings"
-# Voice effects for talking: (key, name, GStreamer elements). All from GStreamer's good
-# and bad plugin sets, which FuriOS installs. Delays are in nanoseconds.
+# Voice effects for talking: (key, name, GStreamer elements). The first choice for a key
+# that can be built wins, so an effect needing an optional plugin can fall back to a
+# rougher one. GStreamer's good and bad plugin sets come with FuriOS; the LADSPA ones
+# need the swh-plugins (ring modulator) and rubberband-ladspa packages. Delays are in
+# nanoseconds; LADSPA plugins here take mono 32-bit float.
+RINGMOD = "audio/x-raw,format=F32LE,channels=1 ! ladspa-ringmod-1188-so-ringmod-1i1o1l"
+RUBBERBAND = ("audio/x-raw,format=F32LE,channels=1 ! "
+              "ladspa-ladspa-rubberband-so-rubberband-live-pitchshifter-mono formant-preserving=true")
 EFFECTS = [
     ("none", "None", "identity"),
     ("deep", "Deep", "pitch pitch=0.75"),
     ("chipmunk", "Chipmunk", "pitch pitch=1.6"),
-    # A very short echo fed back into itself rings like metal.
+    ("higher", "Higher, natural", f"{RUBBERBAND} semitones=4"),
+    ("lower", "Lower, natural", f"{RUBBERBAND} semitones=-4"),
+    # Ring modulation is the classic robot; a short echo on top makes it metallic.
+    ("robot", "Robot", f"{RINGMOD} modulation-depth=1 frequency=100 ! audioecho "
+                       "max-delay=20000000 delay=6000000 intensity=0.4 feedback=0.4 ! "
+                       "volume volume=0.7"),
+    # Without the ring modulator: a very short echo fed back into itself rings like metal.
     ("robot", "Robot", "pitch pitch=0.92 ! audioecho max-delay=20000000 delay=7000000 "
-                       "intensity=0.65 feedback=0.65"),
-    ("cave", "Cave", "audioecho max-delay=500000000 delay=230000000 intensity=0.45 feedback=0.4"),
+                       "intensity=0.65 feedback=0.65 ! volume volume=0.6"),
+    ("dalek", "Dalek", f"{RINGMOD} modulation-depth=1 frequency=30"),
+    ("cave", "Cave", "audioecho max-delay=500000000 delay=230000000 intensity=0.45 feedback=0.4 "
+                     "! volume volume=0.6"),
     ("hall", "Hall", "freeverb room-size=0.85 damping=0.3 level=0.45"),
     ("phone", "Phone call", "audiochebband mode=band-pass lower-frequency=400 "
                             "upper-frequency=3400 poles=4"),
@@ -140,6 +154,21 @@ def active_port(kind, device):
     return next((d.get("active_port") for d in devices(kind, fresh=True) if d["name"] == device), None)
 
 
+def available_effects():
+    """The effects this phone can build, first working choice per key."""
+    found, seen = [], set()
+    for key, name, desc in EFFECTS:
+        if key in seen:
+            continue
+        try:
+            Gst.parse_bin_from_description(f"audioconvert ! {desc} ! audioconvert", True)
+        except GLib.Error:
+            continue
+        found.append((key, name, desc))
+        seen.add(key)
+    return found
+
+
 def timecode(ns):
     s = max(0, ns) // Gst.SECOND
     return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
@@ -161,6 +190,8 @@ class Window(Adw.ApplicationWindow):
         self.effects = {}       # player -> (to the PC, on the phone) volumes, None for previews
         self.talk = None
         self.talk_effect = None  # the effect bin inside the talk pipeline
+        self.swap_pending = False
+        self.base_time = Gst.SystemClock.obtain().get_time()
         self.listen = None
         self.rec = None          # while recording: pipeline, file, sound received
         self.last_seek = 0.0
@@ -171,6 +202,7 @@ class Window(Adw.ApplicationWindow):
             self.saved = json.loads(CONFIG.read_text())
         except (OSError, ValueError):
             self.saved = {}
+        self.voice_effects = available_effects()
 
         # The USB connection
         self.mic = Adw.SwitchRow(title="USB headset for the PC")
@@ -207,8 +239,8 @@ class Window(Adw.ApplicationWindow):
                         "\"Terminal Headset\" as the microphone, the speaker, or both.")
         conn_group.add(self.mic)
         self.effect_row = Adw.ComboRow(title="Voice effect",
-                                       model=Gtk.StringList.new([e[1] for e in EFFECTS]))
-        keys = [e[0] for e in EFFECTS]
+                                       model=Gtk.StringList.new([e[1] for e in self.voice_effects]))
+        keys = [e[0] for e in self.voice_effects]
         self.effect_row.set_selected(keys.index(self.saved.get("effect", "none"))
                                      if self.saved.get("effect") in keys else 0)
         self.effect_row.connect("notify::selected", self.on_effect)
@@ -825,7 +857,8 @@ class Window(Adw.ApplicationWindow):
                 if cancel:
                     dsp.set_property("probe", ECHO_PROBE)
                 chain.append(dsp)
-            chain += [self.effect_bin(), make("audioconvert"), make("audioresample")]
+            self.talk_effect = self.effect_bin()
+            chain += [self.talk_effect, make("audioconvert"), make("audioresample")]
         chain.append(out)
         for e in chain:
             pipe.add(e)
@@ -836,6 +869,12 @@ class Window(Adw.ApplicationWindow):
         bus.connect("message::error", on_error)
         if meter:
             bus.connect("message::element", self.on_level)
+        # One clock and one time origin for every live pipeline: the echo canceller
+        # matches your voice (talk) against what the phone played (listen) by their
+        # timestamps, which only line up if both count from the same moment.
+        pipe.use_clock(Gst.SystemClock.obtain())
+        pipe.set_start_time(Gst.CLOCK_TIME_NONE)
+        pipe.set_base_time(self.base_time)
         pipe.set_state(Gst.State.PLAYING)
         return pipe
 
@@ -863,6 +902,7 @@ class Window(Adw.ApplicationWindow):
         """Rebuild the talk pipeline with the current options, if talking."""
         if not self.talk:
             return
+        self.swap_pending = False
         self.talk.set_state(Gst.State.NULL)
         self.talk.get_bus().remove_signal_watch()
         self.talk = None
@@ -874,43 +914,56 @@ class Window(Adw.ApplicationWindow):
         self.restart_talk()
 
     def effect_bin(self):
-        desc = EFFECTS[self.effect_row.get_selected()][2]
+        desc = self.voice_effects[self.effect_row.get_selected()][2]
         # audioconvert both sides: pitch, for one, only takes floating-point samples.
-        self.talk_effect = Gst.parse_bin_from_description(f"audioconvert ! {desc} ! audioconvert", True)
-        return self.talk_effect
+        return Gst.parse_bin_from_description(f"audioconvert ! {desc} ! audioconvert", True)
 
     def on_effect(self, row, _param):
-        self.saved["effect"] = EFFECTS[row.get_selected()][0]
+        self.saved["effect"] = self.voice_effects[row.get_selected()][0]
         self.save_settings()
-        if not self.talk:
-            return
-        # Swap the effect in place while you talk: wait until no sound is passing the
-        # point before it, then unlink the old one and link the new one.
+        if not self.talk or self.swap_pending:
+            return  # a pending swap picks up the latest choice when it runs
+        # Swap the effect while you talk: hold the sound just before the effect, then
+        # change the graph on the main thread, then let the sound through again.
         pipe = self.talk
+        pad = self.talk_effect.get_static_pad("sink").get_peer()
+        if pad is None:
+            self.restart_talk()
+            return
+        self.swap_pending = True
+
+        def blocked(_pad, info):
+            GLib.idle_add(self.swap_effect, pipe, pad, info.id)
+            return Gst.PadProbeReturn.OK  # stays held until swap_effect removes the probe
+        pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, blocked)
+
+    def swap_effect(self, pipe, pad, probe_id):
+        if pipe is not self.talk or not self.swap_pending:
+            return GLib.SOURCE_REMOVE  # talking stopped or restarted meanwhile
+        self.swap_pending = False
         old = self.talk_effect
+        after = old.get_static_pad("src").get_peer()
         try:
             new = self.effect_bin()
         except GLib.Error as e:
+            pad.remove_probe(probe_id)
             self.toast(f"Can't use that effect: {e.message[:60]}")
-            return
-        before = old.get_static_pad("sink").get_peer()
-        after = old.get_static_pad("src").get_peer()
-
-        def swap(pad, _info):
-            pad.unlink(old.get_static_pad("sink"))
-            old.get_static_pad("src").unlink(after)
-            pipe.add(new)
-            pad.link(new.get_static_pad("sink"))
-            new.get_static_pad("src").link(after)
-            new.sync_state_with_parent()
-            GLib.idle_add(self.drop_element, pipe, old)
-            return Gst.PadProbeReturn.REMOVE
-        before.add_probe(Gst.PadProbeType.IDLE, swap)
-
-    @staticmethod
-    def drop_element(pipe, element):
-        element.set_state(Gst.State.NULL)
-        pipe.remove(element)
+            return GLib.SOURCE_REMOVE
+        ok = (after is not None
+              and pad.unlink(old.get_static_pad("sink"))
+              and old.get_static_pad("src").unlink(after)
+              and pipe.add(new) is None
+              and pad.link(new.get_static_pad("sink")) == Gst.PadLinkReturn.OK
+              and new.get_static_pad("src").link(after) == Gst.PadLinkReturn.OK
+              and new.sync_state_with_parent())
+        if not ok:
+            self.toast("Couldn't change the effect; restarting the voice")
+            self.restart_talk()
+            return GLib.SOURCE_REMOVE
+        self.talk_effect = new
+        pad.remove_probe(probe_id)
+        old.set_state(Gst.State.NULL)
+        pipe.remove(old)
         return GLib.SOURCE_REMOVE
 
     def save_settings(self):
@@ -940,6 +993,7 @@ class Window(Adw.ApplicationWindow):
         self.stop_talk()
 
     def stop_talk(self):
+        self.swap_pending = False
         if self.talk:
             self.talk.set_state(Gst.State.NULL)
             self.talk.get_bus().remove_signal_watch()
