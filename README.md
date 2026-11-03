@@ -39,7 +39,4 @@ The status codes aren't documented by Microsoft, so these causes come from the d
 
 ## Next steps
 
-- Helper: derive the headset serial from the phone's, so two phones don't share `TH0001`.
-- App: PulseAudio is still asked through `pactl` on the GTK thread (time-limited to 3 s, results cached briefly); an asynchronous client would remove the last freezes. Maybe echo cancellation for talk plus listen on the speaker. A recording can't tell an unplugged PC from a silent one, so it stays armed showing "no sound from the PC".
-- Check what `usb-config` does to the gadget when switching USB mode in settings.
-- Proper fix for naming and keeping ACM: an out-of-tree module with a patched UAC1/UAC2 function under a new name (IAD, own strings, no OUT endpoint). The kernel takes unsigned modules and `linux-headers-4.19.325-furiphone-radon` is packaged. Idea from a Codex review, 2026-11-03.
+See `ROADMAP.md`.
